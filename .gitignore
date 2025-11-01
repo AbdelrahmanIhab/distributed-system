@@ -1,1 +1,18 @@
+# Build artifacts
 /target
+Cargo.lock
+
+# Runtime directories
+/shared_images
+/received_images
+/images
+*.log
+
+# Generated config files
+config_network.json
+deploy_node*.sh
+deploy_client.sh
+
+# IDE
+.vscode/
+.idea/
