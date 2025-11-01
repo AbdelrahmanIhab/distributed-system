@@ -392,9 +392,9 @@ async fn main() -> anyhow::Result<()> {
             if ldr == me {
                 // I'm leader; ensure heartbeat task running
             } else {
-                // follower: if no heartbeat for 3 seconds, start election
+                // follower: if no heartbeat for 10 seconds, start election
                 let now = Instant::now();
-                let stale = last.map(|t| now.duration_since(t) > Duration::from_secs(3)).unwrap_or(true);
+                let stale = last.map(|t| now.duration_since(t) > Duration::from_secs(10)).unwrap_or(true);
                 if stale {
                     println!("[Node {}] leader {:?} stale -> starting election", me, leader_opt);
                     start_election(me, net.clone(), peers.clone(), participating.clone(), ok_received.clone(), leader.clone(), heartbeat_handle.clone()).await;
@@ -460,14 +460,14 @@ async fn start_election(
     }
 
     // wait for any Ok for a timeout
-    let wait_dur = Duration::from_secs(2);
+    let wait_dur = Duration::from_secs(5);
     let start = Instant::now();
     while Instant::now().duration_since(start) < wait_dur {
         if ok_received.load(Ordering::SeqCst) {
             // someone higher responded; they will take over the election
             println!("[Node {}] received Ok -> waiting for Coordinator", me);
             // give some time to receive Coordinator
-            sleep(Duration::from_secs(3)).await;
+            sleep(Duration::from_secs(8)).await;
             *participating.write().await = false;
             return;
         }

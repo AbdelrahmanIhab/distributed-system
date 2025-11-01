@@ -130,7 +130,7 @@ impl Net {
                 let peers = self.peers.read().await;
                 *peers.get(&to).context("Unknown peer ID")?
             };
-            let stream = timeout(Duration::from_secs(2), TcpStream::connect(addr)).await??;
+            let stream = timeout(Duration::from_secs(5), TcpStream::connect(addr)).await??;
             let framed = Framed::new(stream, LengthDelimitedCodec::new());
             conns.insert(to, framed);
         }
