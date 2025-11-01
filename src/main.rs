@@ -1,5 +1,6 @@
 mod message;
 mod net;
+mod balancer;
 
 use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Instant, time::{SystemTime, UNIX_EPOCH}};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -9,6 +10,7 @@ use tokio::sync::RwLock;
 
 use message::{Message, NodeId};
 use net::Net;
+use crate::balancer::RoundRobin;
 use rand::RngCore;
 use rand::rngs::OsRng;
 use hex;
@@ -38,6 +40,8 @@ async fn main() -> anyhow::Result<()> {
     let net = Net::new(me, peers.clone(), key);
     // keep a shared, cheap-to-clone handle for closures/tasks
     let peers = Arc::new(peers);
+    // simple round-robin balancer for choosing a peer to send requests to
+    let balancer = Arc::new(RoundRobin::new());
 
     // Shared state
     let leader: Arc<RwLock<Option<NodeId>>> = Arc::new(RwLock::new(None));
@@ -224,33 +228,46 @@ async fn main() -> anyhow::Result<()> {
     // Optional: one-shot image send if environment vars set
     // SEND_IMAGE_PATH=/path/to/img.png SEND_IMAGE_TO=2
     if let Ok(img_path) = std::env::var("SEND_IMAGE_PATH") {
-        if let Ok(to_s) = std::env::var("SEND_IMAGE_TO") {
-            if let Ok(to_id) = to_s.parse::<NodeId>() {
-                let net_clone = net.clone();
-                // spawn a task so sending doesn't block the main loop
-                tokio::spawn(async move {
-                    // Use spawn_blocking for file IO because tokio fs feature isn't enabled.
-                    let path_clone = img_path.clone();
-                    match tokio::task::spawn_blocking(move || std::fs::read(path_clone)).await {
-                        Ok(Ok(bytes)) => {
-                            // generate a short random request id
-                            let mut rid = [0u8; 16];
-                            OsRng.fill_bytes(&mut rid);
-                            let req_id = hex::encode(rid);
-                            let user = std::env::var("USER").unwrap_or_else(|_| "unknown".into());
-                            let msg = Message::EncryptRequest { req_id: req_id.clone(), user, image_bytes: bytes };
-                            match net_clone.send(to_id, &msg).await {
-                                Ok(()) => println!("[Node {}] sent image request {} -> {}", me, req_id, to_id),
-                                Err(e) => eprintln!("[Node {}] failed to send image to {}: {}", me, to_id, e),
-                            }
-                        }
-                        Ok(Err(e)) => eprintln!("[Node {}] failed to read image {}: {}", me, img_path, e),
-                        Err(e) => eprintln!("[Node {}] spawn_blocking failed for {}: {}", me, img_path, e),
-                    }
-                });
-            } else {
-                eprintln!("SEND_IMAGE_TO is not a valid NodeId: {}", to_s);
+        // Determine target: prefer explicit env var, fall back to round-robin balancer
+        let target_opt = match std::env::var("SEND_IMAGE_TO") {
+            Ok(to_s) => match to_s.parse::<NodeId>() {
+                Ok(id) => Some(id),
+                Err(_) => {
+                    eprintln!("SEND_IMAGE_TO is not a valid NodeId: {}", to_s);
+                    None
+                }
+            },
+            Err(_) => {
+                // pick automatically
+                balancer.pick(&*peers, me)
             }
+        };
+
+        if let Some(to_id) = target_opt {
+            let net_clone = net.clone();
+            // spawn a task so sending doesn't block the main loop
+            tokio::spawn(async move {
+                // Use spawn_blocking for file IO because tokio fs feature isn't enabled.
+                let path_clone = img_path.clone();
+                match tokio::task::spawn_blocking(move || std::fs::read(path_clone)).await {
+                    Ok(Ok(bytes)) => {
+                        // generate a short random request id
+                        let mut rid = [0u8; 16];
+                        OsRng.fill_bytes(&mut rid);
+                        let req_id = hex::encode(rid);
+                        let user = std::env::var("USER").unwrap_or_else(|_| "unknown".into());
+                        let msg = Message::EncryptRequest { req_id: req_id.clone(), user, image_bytes: bytes };
+                        match net_clone.send(to_id, &msg).await {
+                            Ok(()) => println!("[Node {}] sent image request {} -> {}", me, req_id, to_id),
+                            Err(e) => eprintln!("[Node {}] failed to send image to {}: {}", me, to_id, e),
+                        }
+                    }
+                    Ok(Err(e)) => eprintln!("[Node {}] failed to read image {}: {}", me, img_path, e),
+                    Err(e) => eprintln!("[Node {}] spawn_blocking failed for {}: {}", me, img_path, e),
+                }
+            });
+        } else {
+            eprintln!("No target available for SEND_IMAGE_PATH; no peers to pick from or invalid SEND_IMAGE_TO");
         }
     }
 
@@ -258,6 +275,8 @@ async fn main() -> anyhow::Result<()> {
     // Command: send-image <node_id> <path>
     let net_repl = net.clone();
     let me_repl = me;
+    let balancer_repl = balancer.clone();
+    let peers_repl = peers.clone();
     // channel to receive lines read by the blocking stdin reader thread
     let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
 
@@ -288,33 +307,54 @@ async fn main() -> anyhow::Result<()> {
             let mut parts = line.split_whitespace();
             match parts.next() {
                 Some("send-image") => {
-                    if let (Some(to_s), Some(path)) = (parts.next(), parts.next()) {
-                        match to_s.parse::<NodeId>() {
-                            Ok(to_id) => {
-                                let path = path.to_string();
-                                let net_clone = net_repl.clone();
-                                tokio::spawn(async move {
-                                    match tokio::task::spawn_blocking(move || std::fs::read(path)).await {
-                                        Ok(Ok(bytes)) => {
-                                            let mut rid = [0u8; 16];
-                                            OsRng.fill_bytes(&mut rid);
-                                            let req_id = hex::encode(rid);
-                                            let user = std::env::var("USER").unwrap_or_else(|_| "unknown".into());
-                                            let msg = Message::EncryptRequest { req_id: req_id.clone(), user, image_bytes: bytes };
-                                            match net_clone.send(to_id, &msg).await {
-                                                Ok(()) => println!("[Node {}] sent image request {} -> {}", me_repl, req_id, to_id),
-                                                Err(e) => eprintln!("[Node {}] failed to send image to {}: {}", me_repl, to_id, e),
-                                            }
-                                        }
-                                        Ok(Err(e)) => eprintln!("[Node {}] failed to read image: {}", me_repl, e),
-                                        Err(e) => eprintln!("[Node {}] spawn_blocking failed: {}", me_repl, e),
-                                    }
-                                });
-                            }
-                            Err(_) => eprintln!("Invalid node id: {}", to_s),
+                    // support: send-image <node_id> <path>
+                    //          send-image auto <path>
+                    //          send-image <path>  (auto pick)
+                    let first = parts.next();
+                    let second = parts.next();
+                    let (to_token, path) = match (first, second) {
+                        (Some(a), Some(b)) => (a.to_string(), b.to_string()),
+                        (Some(a), None) => ("auto".to_string(), a.to_string()),
+                        _ => {
+                            eprintln!("Usage: send-image <node_id> <path> | send-image auto <path> | send-image <path>");
+                            continue;
                         }
+                    };
+
+                    let to_opt: Option<NodeId> = if to_token.eq_ignore_ascii_case("auto") || to_token == "0" {
+                        balancer_repl.pick(&*peers_repl, me_repl)
                     } else {
-                        eprintln!("Usage: send-image <node_id> <path>");
+                        match to_token.parse::<NodeId>() {
+                            Ok(id) => Some(id),
+                            Err(_) => {
+                                eprintln!("Invalid node id: {} (use 'auto' to pick)", to_token);
+                                None
+                            }
+                        }
+                    };
+
+                    if let Some(to_id) = to_opt {
+                        let path = path.to_string();
+                        let net_clone = net_repl.clone();
+                        tokio::spawn(async move {
+                            match tokio::task::spawn_blocking(move || std::fs::read(path)).await {
+                                Ok(Ok(bytes)) => {
+                                    let mut rid = [0u8; 16];
+                                    OsRng.fill_bytes(&mut rid);
+                                    let req_id = hex::encode(rid);
+                                    let user = std::env::var("USER").unwrap_or_else(|_| "unknown".into());
+                                    let msg = Message::EncryptRequest { req_id: req_id.clone(), user, image_bytes: bytes };
+                                    match net_clone.send(to_id, &msg).await {
+                                        Ok(()) => println!("[Node {}] sent image request {} -> {}", me_repl, req_id, to_id),
+                                        Err(e) => eprintln!("[Node {}] failed to send image to {}: {}", me_repl, to_id, e),
+                                    }
+                                }
+                                Ok(Err(e)) => eprintln!("[Node {}] failed to read image: {}", me_repl, e),
+                                Err(e) => eprintln!("[Node {}] spawn_blocking failed: {}", me_repl, e),
+                            }
+                        });
+                    } else {
+                        eprintln!("No eligible target available to send image");
                     }
                 }
                 Some("help") => {
@@ -447,3 +487,4 @@ fn start_heartbeat_task(me: NodeId, net: Net, peers: Arc<HashMap<NodeId, SocketA
         }
     })
 }
+
