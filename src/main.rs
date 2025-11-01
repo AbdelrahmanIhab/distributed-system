@@ -147,12 +147,10 @@ async fn main() -> anyhow::Result<()> {
                         *last = Some(Instant::now());
                     }
                 }
-                Message::EncryptRequest { req_id, user, image_bytes } => {
-                    println!("[Node {}] ✓ RECEIVED EncryptRequest {} from {} ({} bytes)", me, req_id, user, image_bytes.len());
+                Message::EncryptRequest { from, req_id, user, image_bytes } => {
+                    println!("[Node {}] ✓ RECEIVED EncryptRequest {} from node {} user {} ({} bytes)", me, req_id, from, user, image_bytes.len());
 
                     // Send acknowledgment reply back to sender
-                    // Try to determine sender node ID from address (this is imperfect but works for our setup)
-                    // In production, include sender node ID in the message
                     let reply = Message::EncryptReply {
                         req_id: req_id.clone(),
                         ok: true,
@@ -160,20 +158,12 @@ async fn main() -> anyhow::Result<()> {
                         error: None,
                     };
 
-                    // Find which peer this address belongs to and send reply
                     let net_reply = net_proc.clone();
-                    let peers_clone = peers_proc.clone();
                     let req_id_clone = req_id.clone();
                     tokio::spawn(async move {
-                        // Try to find the node ID from address
-                        for (&peer_id, &peer_addr) in peers_clone.iter() {
-                            if peer_addr == addr {
-                                match net_reply.send(peer_id, &reply).await {
-                                    Ok(()) => println!("[Node {}] Sent EncryptReply for {} to node {}", me, req_id_clone, peer_id),
-                                    Err(e) => eprintln!("[Node {}] Failed to send reply: {}", me, e),
-                                }
-                                break;
-                            }
+                        match net_reply.send(from, &reply).await {
+                            Ok(()) => println!("[Node {}] Sent EncryptReply for {} to node {}", me, req_id_clone, from),
+                            Err(e) => eprintln!("[Node {}] Failed to send reply for {} to node {}: {}", me, req_id_clone, from, e),
                         }
                     });
 
@@ -301,9 +291,9 @@ async fn main() -> anyhow::Result<()> {
                         OsRng.fill_bytes(&mut rid);
                         let req_id = hex::encode(rid);
                         let user = std::env::var("USER").unwrap_or_else(|_| "unknown".into());
-                        let msg = Message::EncryptRequest { req_id: req_id.clone(), user, image_bytes: bytes };
+                        let msg = Message::EncryptRequest { from: me, req_id: req_id.clone(), user, image_bytes: bytes };
                         match net_clone.send(to_id, &msg).await {
-                            Ok(()) => println!("[Node {}] sent image request {} -> {}", me, req_id, to_id),
+                            Ok(()) => println!("[Node {}] ✓ Sent image request {} -> node {}", me, req_id, to_id),
                             Err(e) => eprintln!("[Node {}] failed to send image to {}: {}", me, to_id, e),
                         }
                     }
@@ -384,13 +374,14 @@ async fn main() -> anyhow::Result<()> {
                         tokio::spawn(async move {
                             match tokio::task::spawn_blocking(move || std::fs::read(path)).await {
                                 Ok(Ok(bytes)) => {
+                                    let byte_count = bytes.len();
                                     let mut rid = [0u8; 16];
                                     OsRng.fill_bytes(&mut rid);
                                     let req_id = hex::encode(rid);
                                     let user = std::env::var("USER").unwrap_or_else(|_| "unknown".into());
-                                    let msg = Message::EncryptRequest { req_id: req_id.clone(), user, image_bytes: bytes };
+                                    let msg = Message::EncryptRequest { from: me_repl, req_id: req_id.clone(), user, image_bytes: bytes };
                                     match net_clone.send(to_id, &msg).await {
-                                        Ok(()) => println!("[Node {}] sent image request {} -> {}", me_repl, req_id, to_id),
+                                        Ok(()) => println!("[Node {}] ✓ Sent image request {} -> node {} ({} bytes)", me_repl, req_id, to_id, byte_count),
                                         Err(e) => eprintln!("[Node {}] failed to send image to {}: {}", me_repl, to_id, e),
                                     }
                                 }

@@ -11,6 +11,6 @@ pub enum Message {
     Coordinator { leader: NodeId, term: u64 },
 
     // app-level example
-    EncryptRequest { req_id: String, user: String, image_bytes: Vec<u8> },
+    EncryptRequest { from: NodeId, req_id: String, user: String, image_bytes: Vec<u8> },
     EncryptReply { req_id: String, ok: bool, payload: Option<Vec<u8>>, error: Option<String> },
 }
