@@ -15,16 +15,26 @@ Simple step-by-step instructions to deploy the distributed system across 3 compu
 ## Step 1: Find IP Addresses
 
 On each computer, run:
+
+**Linux:**
 ```bash
 ip addr show
 # or
-ifconfig
+hostname -I
+```
+
+**macOS:**
+```bash
+ifconfig | grep "inet " | grep -v 127.0.0.1
+# or
+ipconfig getifaddr en0  # for WiFi
+ipconfig getifaddr en1  # for Ethernet
 ```
 
 Example IPs used in this guide:
-- **Machine 1**: `192.168.1.100`
-- **Machine 2**: `192.168.1.101`
-- **Machine 3**: `192.168.1.102`
+- **Machine 1** (Linux): `192.168.1.100`
+- **Machine 2** (Linux): `192.168.1.101`
+- **Machine 3** (macOS): `192.168.1.102`
 
 ---
 
@@ -85,7 +95,14 @@ cd ~/distributed-system
 # Create images directory
 mkdir -p ~/images
 
-# Allow firewall (change port for each machine)
+# Build the project
+cargo build --release
+```
+
+### Firewall Setup (change port for each machine)
+
+**On Linux (ufw):**
+```bash
 # Machine 1:
 sudo ufw allow 7001/tcp
 
@@ -94,9 +111,17 @@ sudo ufw allow 7002/tcp
 
 # Machine 3:
 sudo ufw allow 7003/tcp
+```
 
-# Build the project
-cargo build --release
+**On macOS:**
+```bash
+# macOS firewall usually allows outbound connections by default
+# If you have firewall enabled and face issues:
+# System Settings > Network > Firewall > Firewall Options
+# Add "cloud-p2p" and allow incoming connections
+
+# Or temporarily disable firewall for testing (not recommended):
+# sudo /usr/libexec/ApplicationFirewall/socketfilterfw --setglobalstate off
 ```
 
 ---
@@ -188,8 +213,15 @@ telnet 192.168.1.102 7003
 ```
 
 ### Check Firewall
+**Linux:**
 ```bash
 sudo ufw status
+```
+
+**macOS:**
+```bash
+# Check if firewall is enabled
+sudo /usr/libexec/ApplicationFirewall/socketfilterfw --getglobalstate
 ```
 
 ### View Logs
