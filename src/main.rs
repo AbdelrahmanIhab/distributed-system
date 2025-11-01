@@ -281,8 +281,8 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // initial jitter then start election
-    let start_delay = Duration::from_millis(500 + (me as u64 * 100));
+    // initial jitter then start election (reduced jitter for faster startup)
+    let start_delay = Duration::from_millis(200 + (me as u64 * 50));
     sleep(start_delay).await;
 
     // Run initial election
@@ -435,16 +435,16 @@ async fn main() -> anyhow::Result<()> {
 
     // Monitor heartbeats: if leader absent for some interval, trigger election
     loop {
-        sleep(Duration::from_secs(1)).await;
+        sleep(Duration::from_millis(500)).await;  // Check every 500ms (faster detection)
         let leader_opt = { leader.read().await.clone() };
         let last = { *last_heartbeat.read().await };
         if let Some(ldr) = leader_opt {
             if ldr == me {
                 // I'm leader; ensure heartbeat task running
             } else {
-                // follower: if no heartbeat for 10 seconds, start election
+                // follower: if no heartbeat for 3 seconds, start election (reduced from 10s)
                 let now = Instant::now();
-                let stale = last.map(|t| now.duration_since(t) > Duration::from_secs(10)).unwrap_or(true);
+                let stale = last.map(|t| now.duration_since(t) > Duration::from_secs(3)).unwrap_or(true);
                 if stale {
                     println!("[Node {}] leader {:?} stale -> starting election", me, leader_opt);
                     start_election(me, net.clone(), peers.clone(), participating.clone(), ok_received.clone(), leader.clone(), heartbeat_handle.clone()).await;
@@ -509,19 +509,19 @@ async fn start_election(
         net.send(*id, &Message::Election { from: me }).await.ok();
     }
 
-    // wait for any Ok for a timeout
-    let wait_dur = Duration::from_secs(5);
+    // wait for any Ok for a timeout (reduced from 5s to 2s)
+    let wait_dur = Duration::from_secs(2);
     let start = Instant::now();
     while Instant::now().duration_since(start) < wait_dur {
         if ok_received.load(Ordering::SeqCst) {
             // someone higher responded; they will take over the election
             println!("[Node {}] received Ok -> waiting for Coordinator", me);
-            // give some time to receive Coordinator
-            sleep(Duration::from_secs(8)).await;
+            // give some time to receive Coordinator (reduced from 8s to 3s)
+            sleep(Duration::from_secs(3)).await;
             *participating.write().await = false;
             return;
         }
-        sleep(Duration::from_millis(100)).await;
+        sleep(Duration::from_millis(50)).await;  // Check more frequently (50ms instead of 100ms)
     }
 
     // no Ok received -> become coordinator
@@ -547,7 +547,7 @@ fn start_heartbeat_task(me: NodeId, net: Net, peers: Arc<HashMap<NodeId, SocketA
                 if id == me { continue; }
                 net.send(id, &Message::Heartbeat { from: me, term: 1 }).await.ok();
             }
-            sleep(Duration::from_secs(1)).await;
+            sleep(Duration::from_millis(500)).await;  // Send heartbeat every 500ms (faster than 1s)
         }
     })
 }
