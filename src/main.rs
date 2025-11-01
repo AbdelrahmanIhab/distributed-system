@@ -33,6 +33,9 @@ async fn main() -> anyhow::Result<()> {
     let config_path = std::env::var("CONFIG_FILE").ok();
     let config = Config::load(config_path.as_deref())?;
     let peers = config.to_peer_map()?;
+    let shared_dir = Arc::new(config.shared_dir.clone());
+
+    println!("[Node {}] Shared directory: {}", me, config.shared_dir);
 
     // Determine bind address: use explicit BIND env var, or lookup my address from peers
     let bind: SocketAddr = match std::env::var("BIND") {
@@ -89,6 +92,7 @@ async fn main() -> anyhow::Result<()> {
     let ok_received_proc = ok_received.clone();
     let heartbeat_handle_proc = heartbeat_handle.clone();
     let peers_proc = peers.clone();
+    let shared_dir_proc = shared_dir.clone();
 
     tokio::spawn(async move {
         while let Some((addr, msg)) = rx.recv().await {
@@ -148,7 +152,47 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
                 Message::EncryptRequest { from, req_id, user, image_bytes } => {
-                    println!("[Node {}] ✓ RECEIVED EncryptRequest {} from node {} user {} ({} bytes)", me, req_id, from, user, image_bytes.len());
+                    println!("[Node {}] ✓ RECEIVED EncryptRequest {} from {} user {} ({} bytes)", me, req_id, if from == 0 { "client" } else { &format!("node {}", from) }, user, image_bytes.len());
+
+                    // Check if this node is the leader
+                    let is_leader = {
+                        let leader_opt = leader_proc.read().await;
+                        leader_opt.map(|l| l == me).unwrap_or(false)
+                    };
+
+                    // Save image to shared directory (always, since client sends to leader)
+                    let dir = shared_dir_proc.as_ref().clone();
+                    let addr_s = addr.to_string().replace(':', "_");
+                    let ts = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+                    // simple extension detection
+                    let ext = if image_bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
+                        "png"
+                    } else if image_bytes.len() > 2 && image_bytes[0] == 0xFF && image_bytes[1] == 0xD8 {
+                        "jpg"
+                    } else {
+                        "bin"
+                    };
+                    let fname = format!("{}_{}_{}.{}", req_id, addr_s, ts, ext);
+                    let path = std::path::Path::new(&dir).join(&fname);
+                    let path_for_closure = path.clone();
+                    let path_for_log = path.clone();
+                    let bytes_clone = image_bytes.clone();
+                    let dir_clone = dir.clone();
+                    let me_clone = me;
+
+                    // Save image in background task
+                    tokio::spawn(async move {
+                        let res = tokio::task::spawn_blocking(move || {
+                            std::fs::create_dir_all(&dir_clone)?;
+                            std::fs::write(&path_for_closure, &bytes_clone)?;
+                            Ok::<(), std::io::Error>(())
+                        }).await;
+                        match res {
+                            Ok(Ok(())) => println!("[Node {}] ✓ Saved image to {:?}", me_clone, path_for_log),
+                            Ok(Err(e)) => eprintln!("[Node {}] ✗ Failed to save image: {}", me_clone, e),
+                            Err(e) => eprintln!("[Node {}] ✗ spawn_blocking join error: {}", me_clone, e),
+                        }
+                    });
 
                     // Send acknowledgment reply back to sender
                     let reply = Message::EncryptReply {
@@ -162,47 +206,10 @@ async fn main() -> anyhow::Result<()> {
                     let req_id_clone = req_id.clone();
                     tokio::spawn(async move {
                         match net_reply.send(from, &reply).await {
-                            Ok(()) => println!("[Node {}] Sent EncryptReply for {} to node {}", me, req_id_clone, from),
-                            Err(e) => eprintln!("[Node {}] Failed to send reply for {} to node {}: {}", me, req_id_clone, from, e),
+                            Ok(()) => println!("[Node {}] ✓ Sent EncryptReply for {} back to sender", me, req_id_clone),
+                            Err(e) => eprintln!("[Node {}] ✗ Failed to send reply for {}: {}", me, req_id_clone, e),
                         }
                     });
-
-                    // Optionally save received image bytes to disk. Controlled by env var SAVE_RECEIVED_IMAGES ("1"/"true").
-                    let save_enabled = std::env::var("SAVE_RECEIVED_IMAGES").unwrap_or_default();
-                    if save_enabled == "1" || save_enabled.eq_ignore_ascii_case("true") {
-                        let dir = std::env::var("SAVE_DIR").unwrap_or_else(|_| "received_images".into());
-                        let addr_s = addr.to_string().replace(':', "_");
-                        let ts = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-                        // simple extension detection
-                        let ext = if image_bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
-                            "png"
-                        } else if image_bytes.len() > 2 && image_bytes[0] == 0xFF && image_bytes[1] == 0xD8 {
-                            "jpg"
-                        } else {
-                            "bin"
-                        };
-                        let fname = format!("{}_{}_{}.{}", req_id, addr_s, ts, ext);
-                        let path = std::path::Path::new(&dir).join(&fname);
-                        // clone path so we can move one into the blocking closure and still print it here
-                        let path_for_closure = path.clone();
-                        let path_for_log = path.clone();
-                        let bytes_clone = image_bytes.clone();
-                        let dir_clone = dir.clone();
-                        let me_clone = me;
-                        // Use blocking file IO in spawn_blocking
-                        tokio::spawn(async move {
-                            let res = tokio::task::spawn_blocking(move || {
-                                std::fs::create_dir_all(&dir_clone)?;
-                                std::fs::write(&path_for_closure, &bytes_clone)?;
-                                Ok::<(), std::io::Error>(())
-                            }).await;
-                            match res {
-                                Ok(Ok(())) => println!("[Node {}] saved received image to {:?}", me_clone, path_for_log),
-                                Ok(Err(e)) => eprintln!("[Node {}] failed to save image: {}", me_clone, e),
-                                Err(e) => eprintln!("[Node {}] spawn_blocking join error: {}", me_clone, e),
-                            }
-                        });
-                    }
                 }
 
                 Message::EncryptReply { req_id, ok, payload, error } => {
@@ -248,7 +255,28 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
 
-                
+                Message::QueryLeader => {
+                    println!("[Node {}] QueryLeader request from {}", me, addr);
+                    let leader_opt = { leader_proc.read().await.clone() };
+                    let reply = Message::LeaderInfo { leader_id: leader_opt, term: 1 };
+                    // Spawn a task to send reply (we need to establish connection back to client)
+                    // Since client initiated connection, we'll respond on same connection via the channel
+                    // But our current architecture doesn't support bidirectional messaging on same connection easily.
+                    // Solution: Client should use a separate listener, OR we send via a new connection.
+                    // For simplicity, we'll note this limitation and client will need to track responses.
+                    // Actually, since the message processor doesn't have access to the framed connection,
+                    // we can't reply directly. The client will need to connect to a known port or
+                    // we need a different approach. Let's document this and handle in client design.
+                    // For now, let's just log - we'll handle this properly when designing client.
+                    println!("[Node {}] Current leader: {:?}", me, leader_opt);
+                }
+
+                Message::LeaderInfo { leader_id, term: _ } => {
+                    // This would be received by a client, not by a server node
+                    println!("[Node {}] Received LeaderInfo: leader={:?}", me, leader_id);
+                }
+
+
             }
         }
     });

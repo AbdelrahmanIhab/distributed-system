@@ -3,6 +3,18 @@ name = "cloud-p2p"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "cloud_p2p"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cloud-p2p"
+path = "src/main.rs"
+
+[[bin]]
+name = "client"
+path = "src/bin/client.rs"
+
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util"] }
 tokio-util = { version = "0.7", features = ["codec"] }

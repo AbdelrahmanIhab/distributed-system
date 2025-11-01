@@ -14,6 +14,12 @@ pub struct PeerConfig {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Config {
     pub peers: Vec<PeerConfig>,
+    #[serde(default = "default_shared_dir")]
+    pub shared_dir: String,
+}
+
+fn default_shared_dir() -> String {
+    "/shared/images".to_string()
 }
 
 impl Config {
@@ -49,7 +55,9 @@ impl Config {
             peers.push(PeerConfig { id, address });
         }
 
-        Ok(Config { peers })
+        let shared_dir = std::env::var("SHARED_DIR").unwrap_or_else(|_| default_shared_dir());
+
+        Ok(Config { peers, shared_dir })
     }
 
     /// Convert to HashMap for easy lookup
@@ -89,6 +97,7 @@ impl Config {
                 PeerConfig { id: 2, address: "127.0.0.1:7002".to_string() },
                 PeerConfig { id: 3, address: "127.0.0.1:7003".to_string() },
             ],
+            shared_dir: std::env::var("SHARED_DIR").unwrap_or_else(|_| default_shared_dir()),
         })
     }
 }
@@ -113,6 +122,7 @@ mod tests {
                 PeerConfig { id: 1, address: "192.168.1.10:7001".to_string() },
                 PeerConfig { id: 2, address: "192.168.1.11:7002".to_string() },
             ],
+            shared_dir: default_shared_dir(),
         };
         let map = config.to_peer_map().unwrap();
         assert_eq!(map.len(), 2);
