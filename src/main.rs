@@ -1,6 +1,7 @@
 mod message;
 mod net;
 mod balancer;
+mod config;
 
 use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Instant, time::{SystemTime, UNIX_EPOCH}};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -11,6 +12,7 @@ use tokio::sync::RwLock;
 use message::{Message, NodeId};
 use net::Net;
 use crate::balancer::RoundRobin;
+use crate::config::Config;
 use rand::RngCore;
 use rand::rngs::OsRng;
 use hex;
@@ -24,15 +26,27 @@ use std::io::BufRead;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Read node ID and bind address from environment
+    // Read node ID from environment
     let me: NodeId = std::env::var("NODE_ID").unwrap_or("1".into()).parse()?;
-    let bind: SocketAddr = std::env::var("BIND").unwrap_or("127.0.0.1:7001".into()).parse()?;
 
-    // Hardcode addresses of all peers (small demo)
-    let mut peers = HashMap::new();
-    peers.insert(1, "127.0.0.1:7001".parse()?);
-    peers.insert(2, "127.0.0.1:7002".parse()?);
-    peers.insert(3, "127.0.0.1:7003".parse()?);
+    // Load peer configuration (from file, env, or default localhost)
+    let config_path = std::env::var("CONFIG_FILE").ok();
+    let config = Config::load(config_path.as_deref())?;
+    let peers = config.to_peer_map()?;
+
+    // Determine bind address: use explicit BIND env var, or lookup my address from peers
+    let bind: SocketAddr = match std::env::var("BIND") {
+        Ok(addr_str) => addr_str.parse()?,
+        Err(_) => {
+            // Look up my address from the peer config
+            peers.get(&me)
+                .copied()
+                .ok_or_else(|| anyhow::anyhow!("Node {} not found in peer configuration", me))?
+        }
+    };
+
+    println!("[Node {}] Starting on {}", me, bind);
+    println!("[Node {}] Peer configuration: {:?}", me, peers);
 
     // For demo purposes use a fixed 32-byte key so peers can encrypt/decrypt.
     // In a real deployment this should come from a secure shared config or env var.
