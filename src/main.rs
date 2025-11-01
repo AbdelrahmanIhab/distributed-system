@@ -11,7 +11,7 @@ use tokio::sync::RwLock;
 
 use message::{Message, NodeId};
 use net::Net;
-use crate::balancer::RoundRobin;
+use crate::balancer::LeastLoad;
 use crate::config::Config;
 use rand::RngCore;
 use rand::rngs::OsRng;
@@ -57,8 +57,8 @@ async fn main() -> anyhow::Result<()> {
     let net = Net::new(me, peers.clone(), key);
     // keep a shared, cheap-to-clone handle for closures/tasks
     let peers = Arc::new(peers);
-    // simple round-robin balancer for choosing a peer to send requests to
-    let balancer = Arc::new(RoundRobin::new());
+    // least-load balancer for choosing the peer with minimum load
+    let balancer = Arc::new(LeastLoad::new());
 
     // Shared state
     let leader: Arc<RwLock<Option<NodeId>>> = Arc::new(RwLock::new(None));
@@ -93,6 +93,7 @@ async fn main() -> anyhow::Result<()> {
     let heartbeat_handle_proc = heartbeat_handle.clone();
     let peers_proc = peers.clone();
     let shared_dir_proc = shared_dir.clone();
+    let balancer_proc = balancer.clone();
 
     tokio::spawn(async move {
         while let Some((addr, msg)) = rx.recv().await {
@@ -160,56 +161,138 @@ async fn main() -> anyhow::Result<()> {
                         leader_opt.map(|l| l == me).unwrap_or(false)
                     };
 
-                    // Save image to shared directory (always, since client sends to leader)
-                    let dir = shared_dir_proc.as_ref().clone();
-                    let addr_s = addr.to_string().replace(':', "_");
-                    let ts = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-                    // simple extension detection
-                    let ext = if image_bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
-                        "png"
-                    } else if image_bytes.len() > 2 && image_bytes[0] == 0xFF && image_bytes[1] == 0xD8 {
-                        "jpg"
+                    if is_leader && from == 0 {
+                        // LEADER RECEIVES REQUEST FROM CLIENT
+                        // Use load balancer to pick the least-loaded node to handle this request
+                        let target_node = balancer_proc.pick(&*peers_proc, me);
+
+                        if let Some(target) = target_node {
+                            // Record the request assignment
+                            balancer_proc.record_request(target);
+
+                            println!("[Node {}] LEADER: Forwarding request {} to Node {} (least loaded)", me, req_id, target);
+
+                            // Forward the request to the selected node
+                            let msg = Message::EncryptRequest {
+                                from: me,  // Leader is forwarding
+                                req_id: req_id.clone(),
+                                user,
+                                image_bytes,
+                            };
+
+                            let net_forward = net_proc.clone();
+                            let req_id_fwd = req_id.clone();
+                            tokio::spawn(async move {
+                                match net_forward.send(target, &msg).await {
+                                    Ok(()) => println!("[Node {}] LEADER: Successfully forwarded request {} to Node {}", me, req_id_fwd, target),
+                                    Err(e) => eprintln!("[Node {}] LEADER: Failed to forward request {} to Node {}: {}", me, req_id_fwd, target, e),
+                                }
+                            });
+                        } else {
+                            // No other nodes available, leader handles it itself
+                            println!("[Node {}] LEADER: No other nodes available, handling request {} locally", me, req_id);
+
+                            let dir = shared_dir_proc.as_ref().clone();
+                            let addr_s = addr.to_string().replace(':', "_");
+                            let ts = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+                            let ext = if image_bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
+                                "png"
+                            } else if image_bytes.len() > 2 && image_bytes[0] == 0xFF && image_bytes[1] == 0xD8 {
+                                "jpg"
+                            } else {
+                                "bin"
+                            };
+                            let fname = format!("{}_{}_{}.{}", req_id, addr_s, ts, ext);
+                            let path = std::path::Path::new(&dir).join(&fname);
+                            let path_for_closure = path.clone();
+                            let path_for_log = path.clone();
+                            let bytes_clone = image_bytes.clone();
+                            let dir_clone = dir.clone();
+                            let me_clone = me;
+
+                            tokio::spawn(async move {
+                                let res = tokio::task::spawn_blocking(move || {
+                                    std::fs::create_dir_all(&dir_clone)?;
+                                    std::fs::write(&path_for_closure, &bytes_clone)?;
+                                    Ok::<(), std::io::Error>(())
+                                }).await;
+                                match res {
+                                    Ok(Ok(())) => println!("[Node {}] ✓ Saved image to {:?}", me_clone, path_for_log),
+                                    Ok(Err(e)) => eprintln!("[Node {}] ✗ Failed to save image: {}", me_clone, e),
+                                    Err(e) => eprintln!("[Node {}] ✗ spawn_blocking join error: {}", me_clone, e),
+                                }
+                            });
+
+                            // Send acknowledgment reply back to client
+                            let reply = Message::EncryptReply {
+                                req_id: req_id.clone(),
+                                ok: true,
+                                payload: None,
+                                error: None,
+                            };
+
+                            let net_reply = net_proc.clone();
+                            let req_id_clone = req_id.clone();
+                            tokio::spawn(async move {
+                                match net_reply.send(from, &reply).await {
+                                    Ok(()) => println!("[Node {}] ✓ Sent EncryptReply for {} back to client", me, req_id_clone),
+                                    Err(e) => eprintln!("[Node {}] ✗ Failed to send reply for {}: {}", me, req_id_clone, e),
+                                }
+                            });
+                        }
                     } else {
-                        "bin"
-                    };
-                    let fname = format!("{}_{}_{}.{}", req_id, addr_s, ts, ext);
-                    let path = std::path::Path::new(&dir).join(&fname);
-                    let path_for_closure = path.clone();
-                    let path_for_log = path.clone();
-                    let bytes_clone = image_bytes.clone();
-                    let dir_clone = dir.clone();
-                    let me_clone = me;
+                        // FOLLOWER NODE OR LEADER HANDLING FORWARDED REQUEST
+                        // Save the image to shared directory
+                        println!("[Node {}] WORKER: Processing request {}", me, req_id);
 
-                    // Save image in background task
-                    tokio::spawn(async move {
-                        let res = tokio::task::spawn_blocking(move || {
-                            std::fs::create_dir_all(&dir_clone)?;
-                            std::fs::write(&path_for_closure, &bytes_clone)?;
-                            Ok::<(), std::io::Error>(())
-                        }).await;
-                        match res {
-                            Ok(Ok(())) => println!("[Node {}] ✓ Saved image to {:?}", me_clone, path_for_log),
-                            Ok(Err(e)) => eprintln!("[Node {}] ✗ Failed to save image: {}", me_clone, e),
-                            Err(e) => eprintln!("[Node {}] ✗ spawn_blocking join error: {}", me_clone, e),
-                        }
-                    });
+                        let dir = shared_dir_proc.as_ref().clone();
+                        let addr_s = addr.to_string().replace(':', "_");
+                        let ts = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+                        let ext = if image_bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
+                            "png"
+                        } else if image_bytes.len() > 2 && image_bytes[0] == 0xFF && image_bytes[1] == 0xD8 {
+                            "jpg"
+                        } else {
+                            "bin"
+                        };
+                        let fname = format!("{}_{}_{}.{}", req_id, addr_s, ts, ext);
+                        let path = std::path::Path::new(&dir).join(&fname);
+                        let path_for_closure = path.clone();
+                        let path_for_log = path.clone();
+                        let bytes_clone = image_bytes.clone();
+                        let dir_clone = dir.clone();
+                        let me_clone = me;
 
-                    // Send acknowledgment reply back to sender
-                    let reply = Message::EncryptReply {
-                        req_id: req_id.clone(),
-                        ok: true,
-                        payload: None,
-                        error: None,
-                    };
+                        tokio::spawn(async move {
+                            let res = tokio::task::spawn_blocking(move || {
+                                std::fs::create_dir_all(&dir_clone)?;
+                                std::fs::write(&path_for_closure, &bytes_clone)?;
+                                Ok::<(), std::io::Error>(())
+                            }).await;
+                            match res {
+                                Ok(Ok(())) => println!("[Node {}] ✓ Saved image to {:?}", me_clone, path_for_log),
+                                Ok(Err(e)) => eprintln!("[Node {}] ✗ Failed to save image: {}", me_clone, e),
+                                Err(e) => eprintln!("[Node {}] ✗ spawn_blocking join error: {}", me_clone, e),
+                            }
+                        });
 
-                    let net_reply = net_proc.clone();
-                    let req_id_clone = req_id.clone();
-                    tokio::spawn(async move {
-                        match net_reply.send(from, &reply).await {
-                            Ok(()) => println!("[Node {}] ✓ Sent EncryptReply for {} back to sender", me, req_id_clone),
-                            Err(e) => eprintln!("[Node {}] ✗ Failed to send reply for {}: {}", me, req_id_clone, e),
-                        }
-                    });
+                        // Send acknowledgment reply back to the leader (who forwarded this)
+                        let reply = Message::EncryptReply {
+                            req_id: req_id.clone(),
+                            ok: true,
+                            payload: None,
+                            error: None,
+                        };
+
+                        let net_reply = net_proc.clone();
+                        let req_id_clone = req_id.clone();
+                        tokio::spawn(async move {
+                            match net_reply.send(from, &reply).await {
+                                Ok(()) => println!("[Node {}] ✓ Sent EncryptReply for {} back to node {}", me, req_id_clone, from),
+                                Err(e) => eprintln!("[Node {}] ✗ Failed to send reply for {}: {}", me, req_id_clone, e),
+                            }
+                        });
+                    }
                 }
 
                 Message::EncryptReply { req_id, ok, payload, error } => {
@@ -291,7 +374,7 @@ async fn main() -> anyhow::Result<()> {
     // Optional: one-shot image send if environment vars set
     // SEND_IMAGE_PATH=/path/to/img.png SEND_IMAGE_TO=2
     if let Ok(img_path) = std::env::var("SEND_IMAGE_PATH") {
-        // Determine target: prefer explicit env var, fall back to round-robin balancer
+        // Determine target: prefer explicit env var, fall back to least-load balancer
         let target_opt = match std::env::var("SEND_IMAGE_TO") {
             Ok(to_s) => match to_s.parse::<NodeId>() {
                 Ok(id) => Some(id),
@@ -301,12 +384,15 @@ async fn main() -> anyhow::Result<()> {
                 }
             },
             Err(_) => {
-                // pick automatically
+                // pick automatically using least-load balancer
                 balancer.pick(&*peers, me)
             }
         };
 
         if let Some(to_id) = target_opt {
+            // Record the request in the load balancer
+            balancer.record_request(to_id);
+
             let net_clone = net.clone();
             // spawn a task so sending doesn't block the main loop
             tokio::spawn(async move {
@@ -397,6 +483,9 @@ async fn main() -> anyhow::Result<()> {
                     };
 
                     if let Some(to_id) = to_opt {
+                        // Record the request in the load balancer
+                        balancer_repl.record_request(to_id);
+
                         let path = path.to_string();
                         let net_clone = net_repl.clone();
                         tokio::spawn(async move {
