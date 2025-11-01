@@ -148,7 +148,34 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
                 Message::EncryptRequest { req_id, user, image_bytes } => {
-                    println!("[Node {}] EncryptRequest {} from {} bytes={}", me, req_id, user, image_bytes.len());
+                    println!("[Node {}] ✓ RECEIVED EncryptRequest {} from {} ({} bytes)", me, req_id, user, image_bytes.len());
+
+                    // Send acknowledgment reply back to sender
+                    // Try to determine sender node ID from address (this is imperfect but works for our setup)
+                    // In production, include sender node ID in the message
+                    let reply = Message::EncryptReply {
+                        req_id: req_id.clone(),
+                        ok: true,
+                        payload: None,
+                        error: None,
+                    };
+
+                    // Find which peer this address belongs to and send reply
+                    let net_reply = net_proc.clone();
+                    let peers_clone = peers_proc.clone();
+                    let req_id_clone = req_id.clone();
+                    tokio::spawn(async move {
+                        // Try to find the node ID from address
+                        for (&peer_id, &peer_addr) in peers_clone.iter() {
+                            if peer_addr == addr {
+                                match net_reply.send(peer_id, &reply).await {
+                                    Ok(()) => println!("[Node {}] Sent EncryptReply for {} to node {}", me, req_id_clone, peer_id),
+                                    Err(e) => eprintln!("[Node {}] Failed to send reply: {}", me, e),
+                                }
+                                break;
+                            }
+                        }
+                    });
 
                     // Optionally save received image bytes to disk. Controlled by env var SAVE_RECEIVED_IMAGES ("1"/"true").
                     let save_enabled = std::env::var("SAVE_RECEIVED_IMAGES").unwrap_or_default();
@@ -189,7 +216,11 @@ async fn main() -> anyhow::Result<()> {
                 }
 
                 Message::EncryptReply { req_id, ok, payload, error } => {
-                    println!("[Node {}] EncryptReply {} ok={} error={:?}", me, req_id, ok, error);
+                    if ok {
+                        println!("[Node {}] ✓ RECEIVED EncryptReply for {} - SUCCESS", me, req_id);
+                    } else {
+                        println!("[Node {}] ✗ RECEIVED EncryptReply for {} - FAILED: {:?}", me, req_id, error);
+                    }
                     if let Some(payload_bytes) = payload {
                         // allow saving replies too if enabled
                         let save_enabled = std::env::var("SAVE_RECEIVED_IMAGES").unwrap_or_default();

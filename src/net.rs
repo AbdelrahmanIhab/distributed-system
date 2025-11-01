@@ -89,7 +89,10 @@ impl Net {
 
         loop {
             let (stream, addr) = listener.accept().await?;
-            let mut framed = Framed::new(stream, LengthDelimitedCodec::new());
+            // Set max frame size to 100MB to support large images
+            let mut codec = LengthDelimitedCodec::new();
+            codec.set_max_frame_length(100 * 1024 * 1024);
+            let mut framed = Framed::new(stream, codec);
             let on_msg = on_msg.clone();
             let net_clone = self.clone();
 
@@ -121,7 +124,10 @@ impl Net {
     /// Sends a serialized message to another node.
     pub async fn send(&self, to: NodeId, msg: &Message) -> Result<()> {
         let payload = serde_json::to_vec(msg)?;
+        let encrypted_size = payload.len();
         let payload = self.encrypt(&payload)?;
+        let final_size = payload.len();
+
         let mut conns = self.conns.write().await;
 
         // Ensure a connection exists
@@ -130,19 +136,32 @@ impl Net {
                 let peers = self.peers.read().await;
                 *peers.get(&to).context("Unknown peer ID")?
             };
+            println!("[Net] Connecting to node {} at {}", to, addr);
             let stream = timeout(Duration::from_secs(5), TcpStream::connect(addr)).await??;
-            let framed = Framed::new(stream, LengthDelimitedCodec::new());
+            // Set max frame size to 100MB to support large images
+            let mut codec = LengthDelimitedCodec::new();
+            codec.set_max_frame_length(100 * 1024 * 1024);
+            let framed = Framed::new(stream, codec);
             conns.insert(to, framed);
+            println!("[Net] Connected to node {}", to);
         }
 
-        // Send the message (remove connection if send fails)
+        // Send the message (remove connection if send fails and return error)
         if let Some(framed) = conns.get_mut(&to) {
-            if let Err(e) = framed.send(Bytes::from(payload)).await {
-                eprintln!("Send error to {to}: {e} — dropping connection");
-                conns.remove(&to);
+            println!("[Net] Sending message to node {} (payload: {} bytes, encrypted: {} bytes)", to, encrypted_size, final_size);
+            match framed.send(Bytes::from(payload)).await {
+                Ok(()) => {
+                    println!("[Net] Successfully sent message to node {}", to);
+                    Ok(())
+                }
+                Err(e) => {
+                    eprintln!("[Net] Send error to {}: {} — dropping connection", to, e);
+                    conns.remove(&to);
+                    Err(anyhow!("Failed to send message to node {}: {}", to, e))
+                }
             }
+        } else {
+            Err(anyhow!("No connection to node {}", to))
         }
-
-        Ok(())
     }
 }
