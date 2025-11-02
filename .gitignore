@@ -8,6 +8,10 @@ Cargo.lock
 /images
 *.log
 
+# Stress test generated files
+/test_images_stress
+stress_test_client_*.log
+
 # Generated config files
 config_network.json
 deploy_node*.sh
