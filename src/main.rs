@@ -170,29 +170,11 @@ async fn main() -> anyhow::Result<()> {
                             // Record the request assignment
                             balancer_proc.record_request(target);
 
-                            println!("[Node {}] LEADER: Forwarding request {} to Node {} (least loaded)", me, req_id, target);
+                            if target == me {
+                                // Leader selected itself as the least-loaded node - handle locally
+                                println!("[Node {}] LEADER: Handling request {} locally (least loaded)", me, req_id);
 
-                            // Forward the request to the selected node
-                            let msg = Message::EncryptRequest {
-                                from: me,  // Leader is forwarding
-                                req_id: req_id.clone(),
-                                user,
-                                image_bytes,
-                            };
-
-                            let net_forward = net_proc.clone();
-                            let req_id_fwd = req_id.clone();
-                            tokio::spawn(async move {
-                                match net_forward.send(target, &msg).await {
-                                    Ok(()) => println!("[Node {}] LEADER: Successfully forwarded request {} to Node {}", me, req_id_fwd, target),
-                                    Err(e) => eprintln!("[Node {}] LEADER: Failed to forward request {} to Node {}: {}", me, req_id_fwd, target, e),
-                                }
-                            });
-                        } else {
-                            // No other nodes available, leader handles it itself
-                            println!("[Node {}] LEADER: No other nodes available, handling request {} locally", me, req_id);
-
-                            let dir = shared_dir_proc.as_ref().clone();
+                                let dir = shared_dir_proc.as_ref().clone();
                             let addr_s = addr.to_string().replace(':', "_");
                             let ts = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
                             let ext = if image_bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
@@ -239,6 +221,29 @@ async fn main() -> anyhow::Result<()> {
                                     Err(e) => eprintln!("[Node {}] ✗ Failed to send reply for {}: {}", me, req_id_clone, e),
                                 }
                             });
+                            } else {
+                                // Leader forwarding to a different node
+                                println!("[Node {}] LEADER: Forwarding request {} to Node {} (least loaded)", me, req_id, target);
+
+                                let msg = Message::EncryptRequest {
+                                    from: me,  // Leader is forwarding
+                                    req_id: req_id.clone(),
+                                    user,
+                                    image_bytes,
+                                };
+
+                                let net_forward = net_proc.clone();
+                                let req_id_fwd = req_id.clone();
+                                tokio::spawn(async move {
+                                    match net_forward.send(target, &msg).await {
+                                        Ok(()) => println!("[Node {}] LEADER: Successfully forwarded request {} to Node {}", me, req_id_fwd, target),
+                                        Err(e) => eprintln!("[Node {}] LEADER: Failed to forward request {} to Node {}: {}", me, req_id_fwd, target, e),
+                                    }
+                                });
+                            }
+                        } else {
+                            // No nodes available - should never happen
+                            eprintln!("[Node {}] LEADER: No nodes available for request {}", me, req_id);
                         }
                     } else {
                         // FOLLOWER NODE OR LEADER HANDLING FORWARDED REQUEST

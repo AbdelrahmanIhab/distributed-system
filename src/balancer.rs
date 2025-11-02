@@ -79,10 +79,10 @@ impl LeastLoad {
         }
     }
 
-    /// Pick the peer with the least load (excluding `me`).
+    /// Pick the peer with the least load (INCLUDING the caller node).
     ///
     /// If multiple peers have the same minimum load, the one with the smallest NodeId is chosen.
-    /// Returns `None` if there are no other peers.
+    /// Returns `None` if there are no peers at all.
     pub fn pick(&self, peers: &HashMap<NodeId, SocketAddr>, me: NodeId) -> Option<NodeId> {
         println!("[LeastLoad] Starting peer selection for node {}", me);
         println!("[LeastLoad] Total peers in cluster: {}", peers.len());
@@ -90,18 +90,17 @@ impl LeastLoad {
         // Get current load state
         let loads = self.loads.read().unwrap();
 
-        // Find candidates (all peers except me)
+        // Find ALL candidates (including me) - leader can also handle requests
         let mut candidates: Vec<NodeId> = peers.keys()
-            .filter(|&&id| id != me)
             .cloned()
             .collect();
 
         if candidates.is_empty() {
-            println!("[LeastLoad] WARNING: No candidates available (only me={}) -> returning None", me);
+            println!("[LeastLoad] WARNING: No candidates available -> returning None");
             return None;
         }
 
-        println!("[LeastLoad] Candidates (excluding me={}): {:?}", me, candidates);
+        println!("[LeastLoad] Candidates (including leader): {:?}", candidates);
 
         // Sort candidates by load (ascending), then by NodeId for deterministic tie-breaking
         candidates.sort_by_key(|&node_id| {
