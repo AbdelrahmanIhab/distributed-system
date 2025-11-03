@@ -10,7 +10,7 @@
     },
     {
       "id": 3,
-      "address": "10.40.59.236:7003"
+      "address": "10.40.6.227:7003"
     }
   ],
   "shared_dir": "./shared_images"

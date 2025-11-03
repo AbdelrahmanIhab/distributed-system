@@ -242,10 +242,28 @@ async fn main() -> anyhow::Result<()> {
 
                                         let net_reply = net_proc.clone();
                                         let req_id_clone = req_id.clone();
+                                        let client_addr_reply = client_addr.clone();
                                         tokio::spawn(async move {
-                                            match net_reply.send(from, &reply).await {
-                                                Ok(()) => println!("[Node {}] 📤 Sent encrypted image for {} back to client", me, req_id_clone),
-                                                Err(e) => eprintln!("[Node {}] ✗ Failed to send encrypted reply for {}: {}", me, req_id_clone, e),
+                                            if let Some(addr_str) = client_addr_reply {
+                                                if let Ok(addr) = addr_str.parse::<std::net::SocketAddr>() {
+                                                    // Temporarily add client to peers
+                                                    net_reply.add_temp_peer(0, addr).await;
+
+                                                    match net_reply.send(0, &reply).await {
+                                                        Ok(()) => {
+                                                            println!("[Node {}] 📤 Sent encrypted image for {} back to client at {}", me, req_id_clone, addr_str);
+                                                            net_reply.remove_temp_peer(0).await;
+                                                        }
+                                                        Err(e) => {
+                                                            eprintln!("[Node {}] ✗ Failed to send encrypted reply to client for {}: {}", me, req_id_clone, e);
+                                                            net_reply.remove_temp_peer(0).await;
+                                                        }
+                                                    }
+                                                } else {
+                                                    eprintln!("[Node {}] ✗ Invalid client address for {}: {}", me, req_id_clone, addr_str);
+                                                }
+                                            } else {
+                                                eprintln!("[Node {}] ✗ No client address provided for request {}", me, req_id_clone);
                                             }
                                         });
                                     }
@@ -314,10 +332,38 @@ async fn main() -> anyhow::Result<()> {
                                 let net_reply = net_proc.clone();
                                 let req_id_clone = req_id.clone();
                                 let from_clone = from;
+                                let client_addr_clone = client_addr.clone();
+
                                 tokio::spawn(async move {
-                                    match net_reply.send(from_clone, &reply).await {
-                                        Ok(()) => println!("[Node {}] 📤 Sent encrypted image for {} back to node {}", me, req_id_clone, from_clone),
-                                        Err(e) => eprintln!("[Node {}] ✗ Failed to send encrypted reply for {}: {}", me, req_id_clone, e),
+                                    // If from is 0 (client), use client_addr for routing
+                                    if from_clone == 0 {
+                                        if let Some(addr_str) = client_addr_clone {
+                                            if let Ok(addr) = addr_str.parse::<std::net::SocketAddr>() {
+                                                // Temporarily add client to peers
+                                                net_reply.add_temp_peer(0, addr).await;
+
+                                                match net_reply.send(0, &reply).await {
+                                                    Ok(()) => {
+                                                        println!("[Node {}] 📤 Sent encrypted image for {} back to client at {}", me, req_id_clone, addr_str);
+                                                        net_reply.remove_temp_peer(0).await;
+                                                    }
+                                                    Err(e) => {
+                                                        eprintln!("[Node {}] ✗ Failed to send encrypted reply to client for {}: {}", me, req_id_clone, e);
+                                                        net_reply.remove_temp_peer(0).await;
+                                                    }
+                                                }
+                                            } else {
+                                                eprintln!("[Node {}] ✗ Invalid client address for {}: {}", me, req_id_clone, addr_str);
+                                            }
+                                        } else {
+                                            eprintln!("[Node {}] ✗ No client address provided for request {}", me, req_id_clone);
+                                        }
+                                    } else {
+                                        // Send back to leader node
+                                        match net_reply.send(from_clone, &reply).await {
+                                            Ok(()) => println!("[Node {}] 📤 Sent encrypted image for {} back to node {}", me, req_id_clone, from_clone),
+                                            Err(e) => eprintln!("[Node {}] ✗ Failed to send encrypted reply for {}: {}", me, req_id_clone, e),
+                                        }
                                     }
                                 });
                             }
