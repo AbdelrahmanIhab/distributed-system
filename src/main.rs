@@ -320,7 +320,7 @@ async fn main() -> anyhow::Result<()> {
                                 println!("[Node {}] ✅ ENCRYPTED: Image {} ({} → {} bytes)",
                                          me, req_id, image_bytes.len(), encrypted.len());
 
-                                // Send encrypted image back to the requester (leader or client)
+                                // Send encrypted image back directly to client (worker always sends to client)
                                 let reply = Message::EncryptReply {
                                     req_id: req_id.clone(),
                                     ok: true,
@@ -331,39 +331,30 @@ async fn main() -> anyhow::Result<()> {
 
                                 let net_reply = net_proc.clone();
                                 let req_id_clone = req_id.clone();
-                                let from_clone = from;
                                 let client_addr_clone = client_addr.clone();
 
                                 tokio::spawn(async move {
-                                    // If from is 0 (client), use client_addr for routing
-                                    if from_clone == 0 {
-                                        if let Some(addr_str) = client_addr_clone {
-                                            if let Ok(addr) = addr_str.parse::<std::net::SocketAddr>() {
-                                                // Temporarily add client to peers
-                                                net_reply.add_temp_peer(0, addr).await;
+                                    // Worker always sends directly to client using client_addr
+                                    if let Some(addr_str) = client_addr_clone {
+                                        if let Ok(addr) = addr_str.parse::<std::net::SocketAddr>() {
+                                            // Temporarily add client to peers
+                                            net_reply.add_temp_peer(0, addr).await;
 
-                                                match net_reply.send(0, &reply).await {
-                                                    Ok(()) => {
-                                                        println!("[Node {}] 📤 Sent encrypted image for {} back to client at {}", me, req_id_clone, addr_str);
-                                                        net_reply.remove_temp_peer(0).await;
-                                                    }
-                                                    Err(e) => {
-                                                        eprintln!("[Node {}] ✗ Failed to send encrypted reply to client for {}: {}", me, req_id_clone, e);
-                                                        net_reply.remove_temp_peer(0).await;
-                                                    }
+                                            match net_reply.send(0, &reply).await {
+                                                Ok(()) => {
+                                                    println!("[Node {}] 📤 WORKER: Sent encrypted image for {} directly to client at {}", me, req_id_clone, addr_str);
+                                                    net_reply.remove_temp_peer(0).await;
                                                 }
-                                            } else {
-                                                eprintln!("[Node {}] ✗ Invalid client address for {}: {}", me, req_id_clone, addr_str);
+                                                Err(e) => {
+                                                    eprintln!("[Node {}] ✗ WORKER: Failed to send encrypted reply to client for {}: {}", me, req_id_clone, e);
+                                                    net_reply.remove_temp_peer(0).await;
+                                                }
                                             }
                                         } else {
-                                            eprintln!("[Node {}] ✗ No client address provided for request {}", me, req_id_clone);
+                                            eprintln!("[Node {}] ✗ WORKER: Invalid client address for {}: {}", me, req_id_clone, addr_str);
                                         }
                                     } else {
-                                        // Send back to leader node
-                                        match net_reply.send(from_clone, &reply).await {
-                                            Ok(()) => println!("[Node {}] 📤 Sent encrypted image for {} back to node {}", me, req_id_clone, from_clone),
-                                            Err(e) => eprintln!("[Node {}] ✗ Failed to send encrypted reply for {}: {}", me, req_id_clone, e),
-                                        }
+                                        eprintln!("[Node {}] ✗ WORKER: No client address provided for request {}", me, req_id_clone);
                                     }
                                 });
                             }
@@ -376,71 +367,31 @@ async fn main() -> anyhow::Result<()> {
                                     original_filename: None,
                                     error: Some(format!("Encryption failed: {}", e)),
                                 };
-                                net_proc.send(from, &reply).await.ok();
+                                // Send error back to client if possible, otherwise to sender
+                                if let Some(ref addr_str) = client_addr {
+                                    if let Ok(addr) = addr_str.parse::<std::net::SocketAddr>() {
+                                        net_proc.add_temp_peer(0, addr).await;
+                                        net_proc.send(0, &reply).await.ok();
+                                        net_proc.remove_temp_peer(0).await;
+                                    }
+                                } else {
+                                    net_proc.send(from, &reply).await.ok();
+                                }
                             }
                         }
                     }
                 }
 
                 Message::EncryptReply { req_id, ok, encrypted_image, original_filename, error } => {
+                    // Workers now send encrypted images directly to clients, so nodes should not receive EncryptReply
+                    // This handler is kept for completeness but should not be triggered in normal operation
                     if ok {
-                        println!("[Node {}] 📥 RECEIVED EncryptReply for {} - SUCCESS", me, req_id);
-
-                        // If leader received encrypted response from worker, forward it to the client
-                        // This is the case when leader forwarded to another node
-                        if let Some(encrypted_bytes) = encrypted_image {
-                            println!("[Node {}] 👑 LEADER: Received encrypted image from worker ({} bytes), forwarding to client",
-                                     me, encrypted_bytes.len());
-
-                            // Look up client address
-                            let client_addr_opt = {
-                                let requests = client_requests_proc.read().await;
-                                requests.get(&req_id).cloned()
-                            };
-
-                            if let Some(client_addr_str) = client_addr_opt {
-                                println!("[Node {}] 📤 Forwarding encrypted image to client at {}", me, client_addr_str);
-
-                                // Parse client address and send directly
-                                let reply = Message::EncryptReply {
-                                    req_id: req_id.clone(),
-                                    ok: true,
-                                    encrypted_image: Some(encrypted_bytes),
-                                    original_filename,
-                                    error: None,
-                                };
-
-                                let net_fwd = net_proc.clone();
-                                let req_id_fwd = req_id.clone();
-                                tokio::spawn(async move {
-                                    // Temporarily add client to peers map
-                                    if let Ok(client_sock_addr) = client_addr_str.parse::<SocketAddr>() {
-                                        // Add client address temporarily
-                                        net_fwd.add_temp_peer(0, client_sock_addr).await;
-
-                                        match net_fwd.send(0, &reply).await {
-                                            Ok(()) => {
-                                                println!("[Node {}] ✅ Forwarded encrypted image for {} to client", me, req_id_fwd);
-                                            }
-                                            Err(e) => eprintln!("[Node {}] ✗ Failed to forward to client: {}", me, e),
-                                        }
-
-                                        // Clean up client from peers
-                                        net_fwd.remove_temp_peer(0).await;
-                                    } else {
-                                        eprintln!("[Node {}] ✗ Invalid client address format: {}", me, client_addr_str);
-                                    }
-                                });
-
-                                // Remove from tracking
-                                client_requests_proc.write().await.remove(&req_id);
-                            } else {
-                                eprintln!("[Node {}] ✗ No client address found for request {}", me, req_id);
-                            }
-                        }
+                        println!("[Node {}] ⚠️  Received unexpected EncryptReply for {} - SUCCESS (workers send directly to clients now)", me, req_id);
                     } else {
-                        println!("[Node {}] ✗ RECEIVED EncryptReply for {} - FAILED: {:?}", me, req_id, error);
+                        println!("[Node {}] ⚠️  Received EncryptReply for {} - FAILED: {:?}", me, req_id, error);
                     }
+                    // Clean up any tracked request
+                    client_requests_proc.write().await.remove(&req_id);
                 }
 
                 Message::QueryLeader => {
