@@ -333,8 +333,11 @@ async fn main() -> anyhow::Result<()> {
                                 let req_id_clone = req_id.clone();
                                 let client_addr_clone = client_addr.clone();
 
+                                let from_node = from;
                                 tokio::spawn(async move {
-                                    // Worker always sends directly to client using client_addr
+                                    // Worker tries to send directly to client first (optimization)
+                                    let mut sent_to_client = false;
+
                                     if let Some(addr_str) = client_addr_clone {
                                         if let Ok(addr) = addr_str.parse::<std::net::SocketAddr>() {
                                             // Temporarily add client to peers
@@ -343,18 +346,24 @@ async fn main() -> anyhow::Result<()> {
                                             match net_reply.send(0, &reply).await {
                                                 Ok(()) => {
                                                     println!("[Node {}] 📤 WORKER: Sent encrypted image for {} directly to client at {}", me, req_id_clone, addr_str);
+                                                    sent_to_client = true;
                                                     net_reply.remove_temp_peer(0).await;
                                                 }
                                                 Err(e) => {
-                                                    eprintln!("[Node {}] ✗ WORKER: Failed to send encrypted reply to client for {}: {}", me, req_id_clone, e);
+                                                    eprintln!("[Node {}] ⚠️  WORKER: Failed to send directly to client for {}: {}", me, req_id_clone, e);
+                                                    eprintln!("[Node {}] 🔄 WORKER: Falling back to sending via leader", me);
                                                     net_reply.remove_temp_peer(0).await;
                                                 }
                                             }
-                                        } else {
-                                            eprintln!("[Node {}] ✗ WORKER: Invalid client address for {}: {}", me, req_id_clone, addr_str);
                                         }
-                                    } else {
-                                        eprintln!("[Node {}] ✗ WORKER: No client address provided for request {}", me, req_id_clone);
+                                    }
+
+                                    // FALLBACK: If direct send failed or no client address, send back through leader
+                                    if !sent_to_client && from_node != 0 {
+                                        match net_reply.send(from_node, &reply).await {
+                                            Ok(()) => println!("[Node {}] 📤 WORKER: Sent encrypted image for {} to leader (node {}) for forwarding", me, req_id_clone, from_node),
+                                            Err(e) => eprintln!("[Node {}] ✗ WORKER: Failed to send to leader for {}: {}", me, req_id_clone, e),
+                                        }
                                     }
                                 });
                             }
@@ -383,15 +392,58 @@ async fn main() -> anyhow::Result<()> {
                 }
 
                 Message::EncryptReply { req_id, ok, encrypted_image, original_filename, error } => {
-                    // Workers now send encrypted images directly to clients, so nodes should not receive EncryptReply
-                    // This handler is kept for completeness but should not be triggered in normal operation
+                    // Leader receives EncryptReply from worker (fallback path when worker can't reach client directly)
                     if ok {
-                        println!("[Node {}] ⚠️  Received unexpected EncryptReply for {} - SUCCESS (workers send directly to clients now)", me, req_id);
+                        println!("[Node {}] 📥 LEADER: Received EncryptReply for {} from worker (fallback path)", me, req_id);
+
+                        if let Some(encrypted_bytes) = encrypted_image {
+                            // Look up client address to forward the response
+                            let client_addr_opt = {
+                                let requests = client_requests_proc.read().await;
+                                requests.get(&req_id).cloned()
+                            };
+
+                            if let Some(client_addr_str) = client_addr_opt {
+                                println!("[Node {}] 📤 LEADER: Forwarding encrypted image to client at {}", me, client_addr_str);
+
+                                let reply = Message::EncryptReply {
+                                    req_id: req_id.clone(),
+                                    ok: true,
+                                    encrypted_image: Some(encrypted_bytes),
+                                    original_filename,
+                                    error: None,
+                                };
+
+                                let net_fwd = net_proc.clone();
+                                let req_id_fwd = req_id.clone();
+                                tokio::spawn(async move {
+                                    if let Ok(client_sock_addr) = client_addr_str.parse::<SocketAddr>() {
+                                        net_fwd.add_temp_peer(0, client_sock_addr).await;
+
+                                        match net_fwd.send(0, &reply).await {
+                                            Ok(()) => {
+                                                println!("[Node {}] ✅ LEADER: Forwarded encrypted image for {} to client", me, req_id_fwd);
+                                            }
+                                            Err(e) => eprintln!("[Node {}] ✗ LEADER: Failed to forward to client: {}", me, e),
+                                        }
+
+                                        net_fwd.remove_temp_peer(0).await;
+                                    } else {
+                                        eprintln!("[Node {}] ✗ LEADER: Invalid client address format: {}", me, client_addr_str);
+                                    }
+                                });
+
+                                // Clean up tracking
+                                client_requests_proc.write().await.remove(&req_id);
+                            } else {
+                                eprintln!("[Node {}] ✗ LEADER: No client address found for request {}", me, req_id);
+                            }
+                        }
                     } else {
-                        println!("[Node {}] ⚠️  Received EncryptReply for {} - FAILED: {:?}", me, req_id, error);
+                        println!("[Node {}] ✗ LEADER: Received EncryptReply for {} - FAILED: {:?}", me, req_id, error);
+                        // Clean up tracking on error
+                        client_requests_proc.write().await.remove(&req_id);
                     }
-                    // Clean up any tracked request
-                    client_requests_proc.write().await.remove(&req_id);
                 }
 
                 Message::QueryLeader => {
