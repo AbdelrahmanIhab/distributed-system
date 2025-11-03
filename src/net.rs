@@ -121,12 +121,95 @@ impl Net {
         }
     }
 
+    /// Bidirectional listener that allows replying on the same connection
+    pub async fn run_listener_bidirectional(
+        &self,
+        bind: SocketAddr,
+        key: Vec<u8>,
+        tx: tokio::sync::mpsc::UnboundedSender<(SocketAddr, Message, Option<tokio::sync::mpsc::UnboundedSender<Message>>)>,
+    ) -> Result<()> {
+        let listener = TcpListener::bind(bind)
+            .await
+            .with_context(|| format!("bind failed on {}", bind))?;
+
+        loop {
+            let (stream, addr) = listener.accept().await?;
+            let mut codec = LengthDelimitedCodec::new();
+            codec.set_max_frame_length(100 * 1024 * 1024);
+            let framed = Framed::new(stream, codec);
+            let tx = tx.clone();
+            let key = key.clone();
+
+            tokio::spawn(async move {
+                // Create a channel for replies on this connection
+                let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
+                let reply_tx_opt = Some(reply_tx);
+
+                // Split the framed connection (reader, writer)
+                let (mut framed_writer, mut framed_reader) = framed.split();
+
+                // Spawn task to send replies back on this connection
+                let key_clone = key.clone();
+                tokio::spawn(async move {
+                    while let Some(reply_msg) = reply_rx.recv().await {
+                        // Encrypt and send
+                        let cipher = Aes256Gcm::new_from_slice(&key_clone).expect("AES key must be 32 bytes");
+                        let mut nonce = [0u8; 12];
+                        OsRng.fill_bytes(&mut nonce);
+                        let nonce_obj = Nonce::from_slice(&nonce);
+
+                        if let Ok(payload) = serde_json::to_vec(&reply_msg) {
+                            if let Ok(ct) = cipher.encrypt(nonce_obj, payload.as_slice()) {
+                                let mut encrypted = Vec::with_capacity(12 + ct.len());
+                                encrypted.extend_from_slice(&nonce);
+                                encrypted.extend_from_slice(&ct);
+
+                                if framed_writer.send(Bytes::from(encrypted)).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                });
+
+                // Read incoming messages
+                while let Some(frame_res) = framed_reader.next().await {
+                    match frame_res {
+                        Ok(bytes_mut) => {
+                            let slice: &[u8] = &bytes_mut;
+
+                            // Decrypt
+                            let cipher = Aes256Gcm::new_from_slice(&key).expect("AES key must be 32 bytes");
+                            if slice.len() < 12 {
+                                continue;
+                            }
+                            let (nonce, ct) = slice.split_at(12);
+                            match cipher.decrypt(Nonce::from_slice(nonce), ct) {
+                                Ok(plain) => {
+                                    match serde_json::from_slice::<Message>(&plain) {
+                                        Ok(msg) => {
+                                            let _ = tx.send((addr, msg, reply_tx_opt.clone()));
+                                        }
+                                        Err(e) => eprintln!("Decode error from {}: {}", addr, e),
+                                    }
+                                }
+                                Err(e) => eprintln!("Decrypt error from {}: {}", addr, e),
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Read error from {}: {}", addr, e);
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+    }
+
     /// Sends a serialized message to another node.
     pub async fn send(&self, to: NodeId, msg: &Message) -> Result<()> {
         let payload = serde_json::to_vec(msg)?;
-        let encrypted_size = payload.len();
         let payload = self.encrypt(&payload)?;
-        let final_size = payload.len();
 
         let mut conns = self.conns.write().await;
 
@@ -136,26 +219,19 @@ impl Net {
                 let peers = self.peers.read().await;
                 *peers.get(&to).context("Unknown peer ID")?
             };
-            println!("[Net] Connecting to node {} at {}", to, addr);
             let stream = timeout(Duration::from_secs(5), TcpStream::connect(addr)).await??;
             // Set max frame size to 100MB to support large images
             let mut codec = LengthDelimitedCodec::new();
             codec.set_max_frame_length(100 * 1024 * 1024);
             let framed = Framed::new(stream, codec);
             conns.insert(to, framed);
-            println!("[Net] Connected to node {}", to);
         }
 
         // Send the message (remove connection if send fails and return error)
         if let Some(framed) = conns.get_mut(&to) {
-            println!("[Net] Sending message to node {} (payload: {} bytes, encrypted: {} bytes)", to, encrypted_size, final_size);
             match framed.send(Bytes::from(payload)).await {
-                Ok(()) => {
-                    println!("[Net] Successfully sent message to node {}", to);
-                    Ok(())
-                }
+                Ok(()) => Ok(()),
                 Err(e) => {
-                    eprintln!("[Net] Send error to {}: {} — dropping connection", to, e);
                     conns.remove(&to);
                     Err(anyhow!("Failed to send message to node {}: {}", to, e))
                 }
@@ -163,6 +239,30 @@ impl Net {
         } else {
             Err(anyhow!("No connection to node {}", to))
         }
+    }
+
+    /// Send a message using an existing framed connection (for replying to clients)
+    pub async fn send_on_connection(
+        framed: &mut Framed<TcpStream, LengthDelimitedCodec>,
+        msg: &Message,
+        key: &[u8],
+    ) -> Result<()> {
+        let cipher = Aes256Gcm::new_from_slice(key).expect("AES key must be 32 bytes");
+        let mut nonce = [0u8; 12];
+        OsRng.fill_bytes(&mut nonce);
+        let nonce_slice = Nonce::from_slice(&nonce);
+
+        let payload = serde_json::to_vec(msg)?;
+        let ct = cipher
+            .encrypt(nonce_slice, payload.as_slice())
+            .map_err(|e| anyhow!(e.to_string()))?;
+
+        let mut encrypted = Vec::with_capacity(12 + ct.len());
+        encrypted.extend_from_slice(&nonce);
+        encrypted.extend_from_slice(&ct);
+
+        framed.send(Bytes::from(encrypted)).await?;
+        Ok(())
     }
 
     /// Temporarily add a peer address for sending a message
