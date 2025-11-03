@@ -43,6 +43,18 @@ async fn main() -> Result<()> {
     }
     println!("[Client] Leader discovered: Node {}", discovered_leader);
 
+    // Create encrypted images directory
+    let encrypted_dir = std::env::var("ENCRYPTED_DIR")
+        .unwrap_or_else(|_| "./encrypted_images".to_string());
+
+    let dir_clone = encrypted_dir.clone();
+    tokio::task::spawn_blocking(move || {
+        std::fs::create_dir_all(&dir_clone)
+    }).await??;
+
+    println!("[Client] 💾 Encrypted images will be stored in: {}", encrypted_dir);
+    let encrypted_dir = Arc::new(encrypted_dir);
+
     // REPL: Interactive commands
     let net_repl = net.clone();
     let leader_repl = leader.clone();
@@ -87,14 +99,50 @@ async fn main() -> Result<()> {
     });
 
     // Handle incoming replies
+    let encrypted_dir_handler = encrypted_dir.clone();
     tokio::spawn(async move {
         while let Some((_addr, msg)) = reply_rx.recv().await {
             match msg {
-                Message::EncryptReply { req_id, ok, payload: _, error } => {
+                Message::EncryptReply { req_id, ok, encrypted_image, original_filename, error } => {
                     if ok {
-                        println!("[Client] ✓ SUCCESS: Image {} was accepted by the server", req_id);
+                        println!("[Client] ✅ SUCCESS: Received encrypted image for {}", req_id);
+
+                        if let Some(enc_bytes) = encrypted_image {
+                            // Determine filename
+                            let filename = match original_filename {
+                                Some(fname) => format!("{}_{}", req_id, fname),
+                                None => format!("{}.enc", req_id),
+                            };
+
+                            let save_path = format!("{}/{}", encrypted_dir_handler.as_ref(), filename);
+                            let save_path_display = save_path.clone();
+
+                            println!("[Client] 💾 Saving encrypted image ({} bytes) to: {}",
+                                     enc_bytes.len(), save_path_display);
+
+                            // Save to disk in background
+                            tokio::spawn(async move {
+                                match tokio::task::spawn_blocking(move || {
+                                    std::fs::write(&save_path, &enc_bytes)
+                                }).await {
+                                    Ok(Ok(())) => {
+                                        println!("[Client] ✅ Encrypted image saved successfully: {}",
+                                                 save_path_display);
+                                    }
+                                    Ok(Err(e)) => {
+                                        eprintln!("[Client] ✗ Failed to save encrypted image: {}", e);
+                                    }
+                                    Err(e) => {
+                                        eprintln!("[Client] ✗ spawn_blocking error: {}", e);
+                                    }
+                                }
+                            });
+                        } else {
+                            eprintln!("[Client] ⚠️  Server returned success but no encrypted image data");
+                        }
                     } else {
-                        println!("[Client] ✗ FAILED: Image {} was rejected: {:?}", req_id, error);
+                        println!("[Client] ✗ FAILED: Encryption request {} failed: {:?}",
+                                 req_id, error);
                     }
                 }
                 _ => {
@@ -139,25 +187,35 @@ async fn main() -> Result<()> {
                 };
 
                 let net_clone = net_repl.clone();
+                let path_clone = path.clone();
                 tokio::spawn(async move {
+                    println!("[Client] 📂 Reading image file: {}", path_clone);
                     match tokio::task::spawn_blocking(move || std::fs::read(path)).await {
                         Ok(Ok(bytes)) => {
                             let byte_count = bytes.len();
+                            println!("[Client] ✅ Image file loaded: {} bytes", byte_count);
+
                             let mut rid = [0u8; 16];
                             OsRng.fill_bytes(&mut rid);
                             let req_id = hex::encode(rid);
                             let user = std::env::var("USER").unwrap_or_else(|_| "client".into());
+
+                            println!("[Client] 📨 Sending encryption request {} to leader (node {})", req_id, leader_id);
 
                             // Client sends with from: 0 (client ID)
                             let msg = Message::EncryptRequest {
                                 from: 0,
                                 req_id: req_id.clone(),
                                 user,
-                                image_bytes: bytes
+                                image_bytes: bytes,
+                                client_addr: Some("127.0.0.1:7100".to_string()),  // Client's listening address
                             };
 
                             match net_clone.send(leader_id, &msg).await {
-                                Ok(()) => println!("[Client] ✓ Sent image {} to leader (node {}) — {} bytes", req_id, leader_id, byte_count),
+                                Ok(()) => {
+                                    println!("[Client] ✅ Image {} sent to leader (node {}) — {} bytes", req_id, leader_id, byte_count);
+                                    println!("[Client] ⏳ Waiting for encrypted response...");
+                                }
                                 Err(e) => eprintln!("[Client] ✗ Failed to send image to leader: {}", e),
                             }
                         }

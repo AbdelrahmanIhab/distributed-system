@@ -164,4 +164,16 @@ impl Net {
             Err(anyhow!("No connection to node {}", to))
         }
     }
+
+    /// Temporarily add a peer address for sending a message
+    pub async fn add_temp_peer(&self, node_id: NodeId, addr: SocketAddr) {
+        let mut peers = self.peers.write().await;
+        peers.insert(node_id, addr);
+    }
+
+    /// Remove a temporary peer
+    pub async fn remove_temp_peer(&self, node_id: NodeId) {
+        let mut peers = self.peers.write().await;
+        peers.remove(&node_id);
+    }
 }

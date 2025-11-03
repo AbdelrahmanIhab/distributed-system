@@ -14,7 +14,13 @@ pub enum Message {
     QueryLeader,
     LeaderInfo { leader_id: Option<NodeId>, term: u64 },
 
-    // app-level example
-    EncryptRequest { from: NodeId, req_id: String, user: String, image_bytes: Vec<u8> },
-    EncryptReply { req_id: String, ok: bool, payload: Option<Vec<u8>>, error: Option<String> },
+    // Image encryption service
+    EncryptRequest { from: NodeId, req_id: String, user: String, image_bytes: Vec<u8>, client_addr: Option<String> },
+    EncryptReply {
+        req_id: String,
+        ok: bool,
+        encrypted_image: Option<Vec<u8>>,  // Encrypted image bytes returned to client
+        original_filename: Option<String>,  // Original filename for client storage
+        error: Option<String>
+    },
 }

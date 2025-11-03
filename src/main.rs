@@ -18,6 +18,22 @@ use rand::rngs::OsRng;
 use hex;
 use std::io::BufRead;
 
+/// Detects image format from magic bytes
+/// Returns (extension, mime_type)
+fn detect_image_format(bytes: &[u8]) -> (&'static str, &'static str) {
+    if bytes.len() >= 8 && bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
+        ("png", "image/png")
+    } else if bytes.len() >= 2 && bytes[0] == 0xFF && bytes[1] == 0xD8 {
+        ("jpg", "image/jpeg")
+    } else if bytes.len() >= 2 && bytes[0] == 0x42 && bytes[1] == 0x4D {
+        ("bmp", "image/bmp")
+    } else if bytes.len() >= 6 && &bytes[0..6] == b"GIF89a" || &bytes[0..6] == b"GIF87a" {
+        ("gif", "image/gif")
+    } else {
+        ("bin", "application/octet-stream")
+    }
+}
+
 /// Simple Bully algorithm implementation (demo)
 /// - On startup each node will attempt an election after a short jitter.
 /// - Higher ID wins. Nodes respond with `Ok` to Election messages from lower IDs.
@@ -36,6 +52,9 @@ async fn main() -> anyhow::Result<()> {
     let shared_dir = Arc::new(config.shared_dir.clone());
 
     println!("[Node {}] Shared directory: {}", me, config.shared_dir);
+
+    // Track client requests: req_id -> client_addr
+    let client_requests: Arc<RwLock<HashMap<String, String>>> = Arc::new(RwLock::new(HashMap::new()));
 
     // Determine bind address: use explicit BIND env var, or lookup my address from peers
     let bind: SocketAddr = match std::env::var("BIND") {
@@ -94,6 +113,7 @@ async fn main() -> anyhow::Result<()> {
     let peers_proc = peers.clone();
     let shared_dir_proc = shared_dir.clone();
     let balancer_proc = balancer.clone();
+    let client_requests_proc = client_requests.clone();
 
     tokio::spawn(async move {
         while let Some((addr, msg)) = rx.recv().await {
@@ -103,9 +123,11 @@ async fn main() -> anyhow::Result<()> {
                     net_proc.send(from, &Message::Ok { from: me }).await.ok();
                 }
                 Message::Election { from } => {
-                    println!("[Node {}] Election from {}", me, from);
+                    println!("[Node {}] ⚡ ELECTION: Received election message from Node {}", me, from);
                     if me > from {
+                        println!("[Node {}] ⚡ ELECTION: I have higher priority ({} > {}), sending OK", me, me, from);
                         net_proc.send(from, &Message::Ok { from: me }).await.ok();
+                        println!("[Node {}] ⚡ ELECTION: Starting my own election process", me);
                         start_election(
                             me,
                             net_proc.clone(),
@@ -116,14 +138,16 @@ async fn main() -> anyhow::Result<()> {
                             heartbeat_handle_proc.clone(),
                         )
                         .await;
+                    } else {
+                        println!("[Node {}] ⚡ ELECTION: Node {} has higher priority, ignoring", me, from);
                     }
                 }
                 Message::Ok { from } => {
-                    println!("[Node {}] Ok from {}", me, from);
+                    println!("[Node {}] ⚡ ELECTION: Received OK from Node {} (higher priority node exists)", me, from);
                     ok_received_proc.store(true, Ordering::SeqCst);
                 }
                 Message::Coordinator { leader: ldr, term: _ } => {
-                    println!("[Node {}] Coordinator announced: {}", me, ldr);
+                    println!("[Node {}] 👑 ELECTION: Node {} announced as LEADER", me, ldr);
                     {
                         let mut g = leader_proc.write().await;
                         *g = Some(ldr);
@@ -137,12 +161,16 @@ async fn main() -> anyhow::Result<()> {
                         *last = Some(Instant::now());
                     }
                     if ldr != me {
+                        println!("[Node {}] 📢 ELECTION: Accepting Node {} as leader, stopping my heartbeat", me, ldr);
                         if let Some(h) = heartbeat_handle_proc.write().await.take() {
                             h.abort();
                         }
+                    } else {
+                        println!("[Node {}] 👑 ELECTION: I am the leader!", me);
                     }
                 }
                 Message::Heartbeat { from, term: _ } => {
+                    println!("[Node {}] 💓 HEARTBEAT: Received from leader {}", me, from);
                     {
                         let mut g = leader_proc.write().await;
                         *g = Some(from);
@@ -152,8 +180,9 @@ async fn main() -> anyhow::Result<()> {
                         *last = Some(Instant::now());
                     }
                 }
-                Message::EncryptRequest { from, req_id, user, image_bytes } => {
-                    println!("[Node {}] ✓ RECEIVED EncryptRequest {} from {} user {} ({} bytes)", me, req_id, if from == 0 { "client" } else { &format!("node {}", from) }, user, image_bytes.len());
+                Message::EncryptRequest { from, req_id, user, image_bytes, client_addr } => {
+                    println!("[Node {}] 📥 RECEIVED EncryptRequest {} from {} user {} ({} bytes)",
+                             me, req_id, if from == 0 { "client".to_string() } else { format!("node {}", from) }, user, image_bytes.len());
 
                     // Check if this node is the leader
                     let is_leader = {
@@ -163,183 +192,205 @@ async fn main() -> anyhow::Result<()> {
 
                     if is_leader && from == 0 {
                         // LEADER RECEIVES REQUEST FROM CLIENT
+                        println!("[Node {}] 👑 LEADER: Received request {} from client", me, req_id);
+
+                        // Store client address for response routing
+                        if let Some(ref addr_str) = client_addr {
+                            client_requests_proc.write().await.insert(req_id.clone(), addr_str.clone());
+                            println!("[Node {}] 📝 Stored client address {} for request {}", me, addr_str, req_id);
+                        }
+
                         // Use load balancer to pick the least-loaded node to handle this request
+                        let loads = balancer_proc.get_loads();
+                        println!("[Node {}] ⚖️  BALANCER: Current loads: {:?}", me, loads);
+
                         let target_node = balancer_proc.pick(&*peers_proc, me);
 
                         if let Some(target) = target_node {
                             // Record the request assignment
                             balancer_proc.record_request(target);
 
+                            println!("[Node {}] ⚖️  BALANCER: Selected Node {} for request {} (least loaded)", me, target, req_id);
+
                             if target == me {
-                                // Leader selected itself as the least-loaded node - handle locally
-                                println!("[Node {}] LEADER: Handling request {} locally (least loaded)", me, req_id);
+                                // Leader selected itself - should not store, just forward back after encryption happens
+                                // In this case, we process locally as a worker and return to ourselves
+                                println!("[Node {}] 🔄 LEADER: Processing locally as worker (least loaded)", me);
 
-                                let dir = shared_dir_proc.as_ref().clone();
-                            let addr_s = addr.to_string().replace(':', "_");
-                            let ts = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-                            let ext = if image_bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
-                                "png"
-                            } else if image_bytes.len() > 2 && image_bytes[0] == 0xFF && image_bytes[1] == 0xD8 {
-                                "jpg"
-                            } else {
-                                "bin"
-                            };
-                            let fname = format!("{}_{}_{}.{}", req_id, addr_s, ts, ext);
-                            let path = std::path::Path::new(&dir).join(&fname);
-                            let path_for_closure = path.clone();
-                            let path_for_log = path.clone();
-                            let bytes_clone = image_bytes.clone();
-                            let dir_clone = dir.clone();
-                            let me_clone = me;
+                                // Detect image format
+                                let (ext, mime) = detect_image_format(&image_bytes);
+                                println!("[Node {}] 🔍 DETECTION: Format detected as {} ({})", me, ext.to_uppercase(), mime);
 
-                            tokio::spawn(async move {
-                                let res = tokio::task::spawn_blocking(move || {
-                                    std::fs::create_dir_all(&dir_clone)?;
-                                    std::fs::write(&path_for_closure, &bytes_clone)?;
-                                    Ok::<(), std::io::Error>(())
-                                }).await;
-                                match res {
-                                    Ok(Ok(())) => println!("[Node {}] ✓ Saved image to {:?}", me_clone, path_for_log),
-                                    Ok(Err(e)) => eprintln!("[Node {}] ✗ Failed to save image: {}", me_clone, e),
-                                    Err(e) => eprintln!("[Node {}] ✗ spawn_blocking join error: {}", me_clone, e),
+                                // Encrypt the image
+                                println!("[Node {}] 🔐 ENCRYPTING: Processing {} bytes...", me, image_bytes.len());
+                                match net_proc.encrypt(&image_bytes) {
+                                    Ok(encrypted) => {
+                                        println!("[Node {}] ✅ ENCRYPTED: Image {} ({} → {} bytes)",
+                                                 me, req_id, image_bytes.len(), encrypted.len());
+
+                                        // Send encrypted image back to client
+                                        let reply = Message::EncryptReply {
+                                            req_id: req_id.clone(),
+                                            ok: true,
+                                            encrypted_image: Some(encrypted),
+                                            original_filename: Some(format!("image.{}", ext)),
+                                            error: None,
+                                        };
+
+                                        let net_reply = net_proc.clone();
+                                        let req_id_clone = req_id.clone();
+                                        tokio::spawn(async move {
+                                            match net_reply.send(from, &reply).await {
+                                                Ok(()) => println!("[Node {}] 📤 Sent encrypted image for {} back to client", me, req_id_clone),
+                                                Err(e) => eprintln!("[Node {}] ✗ Failed to send encrypted reply for {}: {}", me, req_id_clone, e),
+                                            }
+                                        });
+                                    }
+                                    Err(e) => {
+                                        eprintln!("[Node {}] ✗ ENCRYPTION FAILED for {}: {}", me, req_id, e);
+                                        let reply = Message::EncryptReply {
+                                            req_id: req_id.clone(),
+                                            ok: false,
+                                            encrypted_image: None,
+                                            original_filename: None,
+                                            error: Some(format!("Encryption failed: {}", e)),
+                                        };
+                                        net_proc.send(from, &reply).await.ok();
+                                    }
                                 }
-                            });
-
-                            // Send acknowledgment reply back to client
-                            let reply = Message::EncryptReply {
-                                req_id: req_id.clone(),
-                                ok: true,
-                                payload: None,
-                                error: None,
-                            };
-
-                            let net_reply = net_proc.clone();
-                            let req_id_clone = req_id.clone();
-                            tokio::spawn(async move {
-                                match net_reply.send(from, &reply).await {
-                                    Ok(()) => println!("[Node {}] ✓ Sent EncryptReply for {} back to client", me, req_id_clone),
-                                    Err(e) => eprintln!("[Node {}] ✗ Failed to send reply for {}: {}", me, req_id_clone, e),
-                                }
-                            });
                             } else {
                                 // Leader forwarding to a different node
-                                println!("[Node {}] LEADER: Forwarding request {} to Node {} (least loaded)", me, req_id, target);
+                                println!("[Node {}] 📨 LEADER: Forwarding request {} to Node {} (least loaded)", me, req_id, target);
 
                                 let msg = Message::EncryptRequest {
                                     from: me,  // Leader is forwarding
                                     req_id: req_id.clone(),
                                     user,
                                     image_bytes,
+                                    client_addr: client_addr.clone(),  // Pass along client address
                                 };
 
-                                let net_forward = net_proc.clone();
-                                let req_id_fwd = req_id.clone();
-                                tokio::spawn(async move {
-                                    match net_forward.send(target, &msg).await {
-                                        Ok(()) => println!("[Node {}] LEADER: Successfully forwarded request {} to Node {}", me, req_id_fwd, target),
-                                        Err(e) => eprintln!("[Node {}] LEADER: Failed to forward request {} to Node {}: {}", me, req_id_fwd, target, e),
-                                    }
-                                });
+                                net_proc.send(target, &msg).await.ok();
                             }
                         } else {
                             // No nodes available - should never happen
-                            eprintln!("[Node {}] LEADER: No nodes available for request {}", me, req_id);
+                            eprintln!("[Node {}] ✗ LEADER: No nodes available for request {}", me, req_id);
+                            let reply = Message::EncryptReply {
+                                req_id: req_id.clone(),
+                                ok: false,
+                                encrypted_image: None,
+                                original_filename: None,
+                                error: Some("No nodes available".to_string()),
+                            };
+                            net_proc.send(from, &reply).await.ok();
                         }
                     } else {
-                        // FOLLOWER NODE OR LEADER HANDLING FORWARDED REQUEST
-                        // Save the image to shared directory
-                        println!("[Node {}] WORKER: Processing request {}", me, req_id);
+                        // FOLLOWER NODE (WORKER) PROCESSING FORWARDED REQUEST
+                        println!("[Node {}] 👷 WORKER: Processing encryption request {}", me, req_id);
 
-                        let dir = shared_dir_proc.as_ref().clone();
-                        let addr_s = addr.to_string().replace(':', "_");
-                        let ts = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-                        let ext = if image_bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
-                            "png"
-                        } else if image_bytes.len() > 2 && image_bytes[0] == 0xFF && image_bytes[1] == 0xD8 {
-                            "jpg"
-                        } else {
-                            "bin"
-                        };
-                        let fname = format!("{}_{}_{}.{}", req_id, addr_s, ts, ext);
-                        let path = std::path::Path::new(&dir).join(&fname);
-                        let path_for_closure = path.clone();
-                        let path_for_log = path.clone();
-                        let bytes_clone = image_bytes.clone();
-                        let dir_clone = dir.clone();
-                        let me_clone = me;
+                        // Detect image format
+                        let (ext, mime) = detect_image_format(&image_bytes);
+                        println!("[Node {}] 🔍 DETECTION: Format detected as {} ({})", me, ext.to_uppercase(), mime);
 
-                        tokio::spawn(async move {
-                            let res = tokio::task::spawn_blocking(move || {
-                                std::fs::create_dir_all(&dir_clone)?;
-                                std::fs::write(&path_for_closure, &bytes_clone)?;
-                                Ok::<(), std::io::Error>(())
-                            }).await;
-                            match res {
-                                Ok(Ok(())) => println!("[Node {}] ✓ Saved image to {:?}", me_clone, path_for_log),
-                                Ok(Err(e)) => eprintln!("[Node {}] ✗ Failed to save image: {}", me_clone, e),
-                                Err(e) => eprintln!("[Node {}] ✗ spawn_blocking join error: {}", me_clone, e),
+                        // Encrypt the image
+                        println!("[Node {}] 🔐 ENCRYPTING: Processing {} bytes...", me, image_bytes.len());
+                        match net_proc.encrypt(&image_bytes) {
+                            Ok(encrypted) => {
+                                println!("[Node {}] ✅ ENCRYPTED: Image {} ({} → {} bytes)",
+                                         me, req_id, image_bytes.len(), encrypted.len());
+
+                                // Send encrypted image back to the requester (leader or client)
+                                let reply = Message::EncryptReply {
+                                    req_id: req_id.clone(),
+                                    ok: true,
+                                    encrypted_image: Some(encrypted),
+                                    original_filename: Some(format!("image.{}", ext)),
+                                    error: None,
+                                };
+
+                                let net_reply = net_proc.clone();
+                                let req_id_clone = req_id.clone();
+                                let from_clone = from;
+                                tokio::spawn(async move {
+                                    match net_reply.send(from_clone, &reply).await {
+                                        Ok(()) => println!("[Node {}] 📤 Sent encrypted image for {} back to node {}", me, req_id_clone, from_clone),
+                                        Err(e) => eprintln!("[Node {}] ✗ Failed to send encrypted reply for {}: {}", me, req_id_clone, e),
+                                    }
+                                });
                             }
-                        });
-
-                        // Send acknowledgment reply back to the leader (who forwarded this)
-                        let reply = Message::EncryptReply {
-                            req_id: req_id.clone(),
-                            ok: true,
-                            payload: None,
-                            error: None,
-                        };
-
-                        let net_reply = net_proc.clone();
-                        let req_id_clone = req_id.clone();
-                        tokio::spawn(async move {
-                            match net_reply.send(from, &reply).await {
-                                Ok(()) => println!("[Node {}] ✓ Sent EncryptReply for {} back to node {}", me, req_id_clone, from),
-                                Err(e) => eprintln!("[Node {}] ✗ Failed to send reply for {}: {}", me, req_id_clone, e),
+                            Err(e) => {
+                                eprintln!("[Node {}] ✗ ENCRYPTION FAILED for {}: {}", me, req_id, e);
+                                let reply = Message::EncryptReply {
+                                    req_id: req_id.clone(),
+                                    ok: false,
+                                    encrypted_image: None,
+                                    original_filename: None,
+                                    error: Some(format!("Encryption failed: {}", e)),
+                                };
+                                net_proc.send(from, &reply).await.ok();
                             }
-                        });
+                        }
                     }
                 }
 
-                Message::EncryptReply { req_id, ok, payload, error } => {
+                Message::EncryptReply { req_id, ok, encrypted_image, original_filename, error } => {
                     if ok {
-                        println!("[Node {}] ✓ RECEIVED EncryptReply for {} - SUCCESS", me, req_id);
+                        println!("[Node {}] 📥 RECEIVED EncryptReply for {} - SUCCESS", me, req_id);
+
+                        // If leader received encrypted response from worker, forward it to the client
+                        // This is the case when leader forwarded to another node
+                        if let Some(encrypted_bytes) = encrypted_image {
+                            println!("[Node {}] 👑 LEADER: Received encrypted image from worker ({} bytes), forwarding to client",
+                                     me, encrypted_bytes.len());
+
+                            // Look up client address
+                            let client_addr_opt = {
+                                let requests = client_requests_proc.read().await;
+                                requests.get(&req_id).cloned()
+                            };
+
+                            if let Some(client_addr_str) = client_addr_opt {
+                                println!("[Node {}] 📤 Forwarding encrypted image to client at {}", me, client_addr_str);
+
+                                // Parse client address and send directly
+                                let reply = Message::EncryptReply {
+                                    req_id: req_id.clone(),
+                                    ok: true,
+                                    encrypted_image: Some(encrypted_bytes),
+                                    original_filename,
+                                    error: None,
+                                };
+
+                                let net_fwd = net_proc.clone();
+                                let req_id_fwd = req_id.clone();
+                                tokio::spawn(async move {
+                                    // Temporarily add client to peers map
+                                    if let Ok(client_sock_addr) = client_addr_str.parse::<SocketAddr>() {
+                                        // Add client address temporarily
+                                        net_fwd.add_temp_peer(0, client_sock_addr).await;
+
+                                        match net_fwd.send(0, &reply).await {
+                                            Ok(()) => {
+                                                println!("[Node {}] ✅ Forwarded encrypted image for {} to client", me, req_id_fwd);
+                                            }
+                                            Err(e) => eprintln!("[Node {}] ✗ Failed to forward to client: {}", me, e),
+                                        }
+
+                                        // Clean up client from peers
+                                        net_fwd.remove_temp_peer(0).await;
+                                    } else {
+                                        eprintln!("[Node {}] ✗ Invalid client address format: {}", me, client_addr_str);
+                                    }
+                                });
+
+                                // Remove from tracking
+                                client_requests_proc.write().await.remove(&req_id);
+                            } else {
+                                eprintln!("[Node {}] ✗ No client address found for request {}", me, req_id);
+                            }
+                        }
                     } else {
                         println!("[Node {}] ✗ RECEIVED EncryptReply for {} - FAILED: {:?}", me, req_id, error);
-                    }
-                    if let Some(payload_bytes) = payload {
-                        // allow saving replies too if enabled
-                        let save_enabled = std::env::var("SAVE_RECEIVED_IMAGES").unwrap_or_default();
-                        if save_enabled == "1" || save_enabled.eq_ignore_ascii_case("true") {
-                            let dir = std::env::var("SAVE_DIR").unwrap_or_else(|_| "received_images".into());
-                            let addr_s = addr.to_string().replace(':', "_");
-                            let ts = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-                            let ext = if payload_bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
-                                "png"
-                            } else if payload_bytes.len() > 2 && payload_bytes[0] == 0xFF && payload_bytes[1] == 0xD8 {
-                                "jpg"
-                            } else {
-                                "bin"
-                            };
-                            let fname = format!("reply_{}_{}_{}.{}", req_id, addr_s, ts, ext);
-                            let path = std::path::Path::new(&dir).join(&fname);
-                            let path_for_closure = path.clone();
-                            let path_for_log = path.clone();
-                            let bytes_clone = payload_bytes.clone();
-                            let dir_clone = dir.clone();
-                            let me_clone = me;
-                            tokio::spawn(async move {
-                                let res = tokio::task::spawn_blocking(move || {
-                                    std::fs::create_dir_all(&dir_clone)?;
-                                    std::fs::write(&path_for_closure, &bytes_clone)?;
-                                    Ok::<(), std::io::Error>(())
-                                }).await;
-                                match res {
-                                    Ok(Ok(())) => println!("[Node {}] saved reply payload to {:?}", me_clone, path_for_log),
-                                    Ok(Err(e)) => eprintln!("[Node {}] failed to save reply payload: {}", me_clone, e),
-                                    Err(e) => eprintln!("[Node {}] spawn_blocking join error: {}", me_clone, e),
-                                }
-                            });
-                        }
                     }
                 }
 
@@ -410,7 +461,7 @@ async fn main() -> anyhow::Result<()> {
                         OsRng.fill_bytes(&mut rid);
                         let req_id = hex::encode(rid);
                         let user = std::env::var("USER").unwrap_or_else(|_| "unknown".into());
-                        let msg = Message::EncryptRequest { from: me, req_id: req_id.clone(), user, image_bytes: bytes };
+                        let msg = Message::EncryptRequest { from: me, req_id: req_id.clone(), user, image_bytes: bytes, client_addr: None };
                         match net_clone.send(to_id, &msg).await {
                             Ok(()) => println!("[Node {}] ✓ Sent image request {} -> node {}", me, req_id, to_id),
                             Err(e) => eprintln!("[Node {}] failed to send image to {}: {}", me, to_id, e),
@@ -501,7 +552,7 @@ async fn main() -> anyhow::Result<()> {
                                     OsRng.fill_bytes(&mut rid);
                                     let req_id = hex::encode(rid);
                                     let user = std::env::var("USER").unwrap_or_else(|_| "unknown".into());
-                                    let msg = Message::EncryptRequest { from: me_repl, req_id: req_id.clone(), user, image_bytes: bytes };
+                                    let msg = Message::EncryptRequest { from: me_repl, req_id: req_id.clone(), user, image_bytes: bytes, client_addr: None };
                                     match net_clone.send(to_id, &msg).await {
                                         Ok(()) => println!("[Node {}] ✓ Sent image request {} -> node {} ({} bytes)", me_repl, req_id, to_id, byte_count),
                                         Err(e) => eprintln!("[Node {}] failed to send image to {}: {}", me_repl, to_id, e),
@@ -540,13 +591,14 @@ async fn main() -> anyhow::Result<()> {
                 let now = Instant::now();
                 let stale = last.map(|t| now.duration_since(t) > Duration::from_secs(3)).unwrap_or(true);
                 if stale {
-                    println!("[Node {}] leader {:?} stale -> starting election", me, leader_opt);
+                    println!("[Node {}] ⚠️  TIMEOUT: No heartbeat from leader {} for 3 seconds", me, ldr);
+                    println!("[Node {}] ⚡ ELECTION: Starting new election due to leader timeout", me);
                     start_election(me, net.clone(), peers.clone(), participating.clone(), ok_received.clone(), leader.clone(), heartbeat_handle.clone()).await;
                 }
             }
         } else {
             // no leader known, start election
-            println!("[Node {}] no leader -> starting election", me);
+            println!("[Node {}] ⚡ ELECTION: No leader known, starting election", me);
             start_election(me, net.clone(), peers.clone(), participating.clone(), ok_received.clone(), leader.clone(), heartbeat_handle.clone()).await;
         }
     }
@@ -566,11 +618,13 @@ async fn start_election(
     {
         let mut p = participating.write().await;
         if *p {
+            println!("[Node {}] ⚡ ELECTION: Already participating in election, skipping", me);
             return;
         }
         *p = true;
     }
 
+    println!("[Node {}] ⚡ ELECTION: Starting election process", me);
     ok_received.store(false, Ordering::SeqCst);
 
     // Find higher nodes
@@ -578,19 +632,23 @@ async fn start_election(
 
     if higher.is_empty() {
         // we are highest -> become coordinator
-        println!("[Node {}] no higher nodes -> becoming coordinator", me);
+        println!("[Node {}] ⚡ ELECTION: No higher priority nodes found", me);
+        println!("[Node {}] 👑 ELECTION: Becoming LEADER (highest priority)", me);
         {
             let mut g = leader.write().await;
             *g = Some(me);
         }
         // announce to all
+        let peer_count = peers.len() - 1;
+        println!("[Node {}] 📢 ELECTION: Announcing leadership to {} peers", me, peer_count);
         for (&id, _) in peers.iter() {
             if id == me { continue; }
             net.send(id, &Message::Coordinator { leader: me, term: 1 }).await.ok();
         }
 
         // start heartbeats
-    let h = start_heartbeat_task(me, net.clone(), peers.clone());
+        println!("[Node {}] 💓 HEARTBEAT: Starting heartbeat task", me);
+        let h = start_heartbeat_task(me, net.clone(), peers.clone());
         *heartbeat_handle.write().await = Some(h);
 
         // done participating
@@ -599,17 +657,21 @@ async fn start_election(
     }
 
     // send Election to all higher nodes
+    println!("[Node {}] ⚡ ELECTION: Contacting {} higher priority nodes: {:?}", me, higher.len(), higher);
     for id in higher.iter() {
+        println!("[Node {}] ⚡ ELECTION: Sending election message to Node {}", me, id);
         net.send(*id, &Message::Election { from: me }).await.ok();
     }
 
     // wait for any Ok for a timeout (reduced from 5s to 2s)
+    println!("[Node {}] ⚡ ELECTION: Waiting 2 seconds for OK responses...", me);
     let wait_dur = Duration::from_secs(2);
     let start = Instant::now();
     while Instant::now().duration_since(start) < wait_dur {
         if ok_received.load(Ordering::SeqCst) {
             // someone higher responded; they will take over the election
-            println!("[Node {}] received Ok -> waiting for Coordinator", me);
+            println!("[Node {}] ⚡ ELECTION: Received OK from higher priority node", me);
+            println!("[Node {}] ⚡ ELECTION: Waiting for coordinator announcement...", me);
             // give some time to receive Coordinator (reduced from 8s to 3s)
             sleep(Duration::from_secs(3)).await;
             *participating.write().await = false;
@@ -619,15 +681,19 @@ async fn start_election(
     }
 
     // no Ok received -> become coordinator
-    println!("[Node {}] no Ok received -> becoming coordinator", me);
+    println!("[Node {}] ⚡ ELECTION: No OK received from higher priority nodes", me);
+    println!("[Node {}] 👑 ELECTION: Becoming LEADER", me);
     {
         let mut g = leader.write().await;
         *g = Some(me);
     }
+    let peer_count = peers.len() - 1;
+    println!("[Node {}] 📢 ELECTION: Announcing leadership to {} peers", me, peer_count);
     for (&id, _) in peers.iter() {
         if id == me { continue; }
         net.send(id, &Message::Coordinator { leader: me, term: 1 }).await.ok();
     }
+    println!("[Node {}] 💓 HEARTBEAT: Starting heartbeat task", me);
     let h = start_heartbeat_task(me, net.clone(), peers.clone());
     *heartbeat_handle.write().await = Some(h);
     *participating.write().await = false;
@@ -635,7 +701,8 @@ async fn start_election(
 
 fn start_heartbeat_task(me: NodeId, net: Net, peers: Arc<HashMap<NodeId, SocketAddr>>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        println!("[Node {}] starting heartbeat task", me);
+        let follower_count = peers.len() - 1;
+        println!("[Node {}] 💓 HEARTBEAT: Task started, monitoring {} followers", me, follower_count);
         loop {
             for (&id, _) in peers.iter() {
                 if id == me { continue; }
