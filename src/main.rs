@@ -115,6 +115,7 @@ async fn main() -> anyhow::Result<()> {
     let shared_dir_proc = shared_dir.clone();
     let balancer_proc = balancer.clone();
     let client_requests_proc = client_requests.clone();
+    let last_election_proc = last_election.clone();
 
     tokio::spawn(async move {
         while let Some((addr, msg)) = rx.recv().await {
@@ -137,6 +138,7 @@ async fn main() -> anyhow::Result<()> {
                             ok_received_proc.clone(),
                             leader_proc.clone(),
                             heartbeat_handle_proc.clone(),
+                            last_election_proc.clone(),
                         )
                         .await;
                     } else {
@@ -425,8 +427,17 @@ async fn main() -> anyhow::Result<()> {
     let start_delay = Duration::from_millis(200 + (me as u64 * 50));
     sleep(start_delay).await;
 
-    // Run initial election
-    start_election(me, net.clone(), peers.clone(), participating.clone(), ok_received.clone(), leader.clone(), heartbeat_handle.clone()).await;
+    // Run initial election (only if no leader has been established yet)
+    {
+        let ldr = leader.read().await;
+        if ldr.is_none() {
+            println!("[Node {}] ⚡ ELECTION: Running initial startup election", me);
+            drop(ldr);  // Release lock before calling start_election
+            start_election(me, net.clone(), peers.clone(), participating.clone(), ok_received.clone(), leader.clone(), heartbeat_handle.clone(), last_election.clone()).await;
+        } else {
+            println!("[Node {}] ⚡ ELECTION: Skipping initial election (leader already established: Node {})", me, ldr.unwrap());
+        }
+    }
 
     // Optional: one-shot image send if environment vars set
     // SEND_IMAGE_PATH=/path/to/img.png SEND_IMAGE_TO=2
@@ -585,13 +596,23 @@ async fn main() -> anyhow::Result<()> {
 
     loop {
         sleep(Duration::from_millis(500)).await;  // Check every 500ms (faster detection)
+
         let leader_opt = { leader.read().await.clone() };
         let last = { *last_heartbeat.read().await };
         let now = Instant::now();
 
+        // Skip if already participating in an election (check AFTER reading leader state)
+        {
+            let p = participating.read().await;
+            if *p {
+                continue;
+            }
+        }
+
         if let Some(ldr) = leader_opt {
             if ldr == me {
                 // I'm leader; ensure heartbeat task running
+                // Leaders should never start elections (they send heartbeats instead)
             } else {
                 // follower: if no heartbeat for 3 seconds, start election (reduced from 10s)
                 let stale = last.map(|t| now.duration_since(t) > Duration::from_secs(3)).unwrap_or(true);
@@ -604,8 +625,7 @@ async fn main() -> anyhow::Result<()> {
                     if time_since_last_election >= ELECTION_COOLDOWN {
                         println!("[Node {}] ⚠️  TIMEOUT: No heartbeat from leader {} for 3 seconds", me, ldr);
                         println!("[Node {}] ⚡ ELECTION: Starting new election due to leader timeout", me);
-                        *last_election.write().await = now;
-                        start_election(me, net.clone(), peers.clone(), participating.clone(), ok_received.clone(), leader.clone(), heartbeat_handle.clone()).await;
+                        start_election(me, net.clone(), peers.clone(), participating.clone(), ok_received.clone(), leader.clone(), heartbeat_handle.clone(), last_election.clone()).await;
                     } else {
                         // Too soon since last election, wait longer (only log every 2 seconds to reduce spam)
                         if now.duration_since(last_cooldown_msg) > Duration::from_secs(2) {
@@ -623,9 +643,14 @@ async fn main() -> anyhow::Result<()> {
             let time_since_last_election = now.duration_since(last_election_time);
 
             if time_since_last_election >= ELECTION_COOLDOWN {
-                println!("[Node {}] ⚡ ELECTION: No leader known, starting election", me);
-                *last_election.write().await = now;
-                start_election(me, net.clone(), peers.clone(), participating.clone(), ok_received.clone(), leader.clone(), heartbeat_handle.clone()).await;
+                // Double-check participating flag before starting (prevent race condition)
+                let p = participating.read().await;
+                if *p {
+                    continue;
+                }
+
+                println!("[Node {}] ⚡ ELECTION: No leader known, starting election (cooldown passed)", me);
+                start_election(me, net.clone(), peers.clone(), participating.clone(), ok_received.clone(), leader.clone(), heartbeat_handle.clone(), last_election.clone()).await;
             }
         }
     }
@@ -640,6 +665,7 @@ async fn start_election(
     ok_received: Arc<AtomicBool>,
     leader: Arc<RwLock<Option<NodeId>>>,
     heartbeat_handle: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
+    last_election: Arc<RwLock<Instant>>,
 ) {
     // Only one election at a time
     {
@@ -650,6 +676,9 @@ async fn start_election(
         }
         *p = true;
     }
+
+    // Update last election timestamp
+    *last_election.write().await = Instant::now();
 
     println!("[Node {}] ⚡ ELECTION: Starting election process", me);
     ok_received.store(false, Ordering::SeqCst);
