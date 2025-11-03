@@ -173,7 +173,7 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
                 Message::Heartbeat { from, term: _ } => {
-                    println!("[Node {}] 💓 HEARTBEAT: Received from leader {}", me, from);
+                    // Silently update leader and heartbeat timestamp
                     {
                         let mut g = leader_proc.write().await;
                         *g = Some(from);
