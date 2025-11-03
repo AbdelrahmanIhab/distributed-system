@@ -85,6 +85,7 @@ async fn main() -> anyhow::Result<()> {
     let last_heartbeat: Arc<RwLock<Option<Instant>>> = Arc::new(RwLock::new(None));
     let ok_received = Arc::new(AtomicBool::new(false));
     let heartbeat_handle: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>> = Arc::new(RwLock::new(None));
+    let last_election: Arc<RwLock<Instant>> = Arc::new(RwLock::new(Instant::now()));
 
     // We'll forward incoming messages to a channel so the listener callback remains a simple Fn
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(SocketAddr, Message)>();
@@ -579,27 +580,53 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // Monitor heartbeats: if leader absent for some interval, trigger election
+    const ELECTION_COOLDOWN: Duration = Duration::from_secs(5);  // Minimum time between elections
+    let mut last_cooldown_msg = Instant::now();
+
     loop {
         sleep(Duration::from_millis(500)).await;  // Check every 500ms (faster detection)
         let leader_opt = { leader.read().await.clone() };
         let last = { *last_heartbeat.read().await };
+        let now = Instant::now();
+
         if let Some(ldr) = leader_opt {
             if ldr == me {
                 // I'm leader; ensure heartbeat task running
             } else {
                 // follower: if no heartbeat for 3 seconds, start election (reduced from 10s)
-                let now = Instant::now();
                 let stale = last.map(|t| now.duration_since(t) > Duration::from_secs(3)).unwrap_or(true);
+
                 if stale {
-                    println!("[Node {}] ⚠️  TIMEOUT: No heartbeat from leader {} for 3 seconds", me, ldr);
-                    println!("[Node {}] ⚡ ELECTION: Starting new election due to leader timeout", me);
-                    start_election(me, net.clone(), peers.clone(), participating.clone(), ok_received.clone(), leader.clone(), heartbeat_handle.clone()).await;
+                    // Check if enough time has passed since last election (prevent election storms)
+                    let last_election_time = { *last_election.read().await };
+                    let time_since_last_election = now.duration_since(last_election_time);
+
+                    if time_since_last_election >= ELECTION_COOLDOWN {
+                        println!("[Node {}] ⚠️  TIMEOUT: No heartbeat from leader {} for 3 seconds", me, ldr);
+                        println!("[Node {}] ⚡ ELECTION: Starting new election due to leader timeout", me);
+                        *last_election.write().await = now;
+                        start_election(me, net.clone(), peers.clone(), participating.clone(), ok_received.clone(), leader.clone(), heartbeat_handle.clone()).await;
+                    } else {
+                        // Too soon since last election, wait longer (only log every 2 seconds to reduce spam)
+                        if now.duration_since(last_cooldown_msg) > Duration::from_secs(2) {
+                            let remaining = ELECTION_COOLDOWN - time_since_last_election;
+                            println!("[Node {}] ⏸️  ELECTION: Cooldown active, waiting {:.1}s before next election",
+                                    me, remaining.as_secs_f32());
+                            last_cooldown_msg = now;
+                        }
+                    }
                 }
             }
         } else {
-            // no leader known, start election
-            println!("[Node {}] ⚡ ELECTION: No leader known, starting election", me);
-            start_election(me, net.clone(), peers.clone(), participating.clone(), ok_received.clone(), leader.clone(), heartbeat_handle.clone()).await;
+            // no leader known, start election (with cooldown)
+            let last_election_time = { *last_election.read().await };
+            let time_since_last_election = now.duration_since(last_election_time);
+
+            if time_since_last_election >= ELECTION_COOLDOWN {
+                println!("[Node {}] ⚡ ELECTION: No leader known, starting election", me);
+                *last_election.write().await = now;
+                start_election(me, net.clone(), peers.clone(), participating.clone(), ok_received.clone(), leader.clone(), heartbeat_handle.clone()).await;
+            }
         }
     }
 }
@@ -656,15 +683,52 @@ async fn start_election(
         return;
     }
 
-    // send Election to all higher nodes
+    // send Election to all higher nodes and track which ones are reachable
     println!("[Node {}] ⚡ ELECTION: Contacting {} higher priority nodes: {:?}", me, higher.len(), higher);
+    let mut reachable_higher: Vec<NodeId> = Vec::new();
+    let mut unreachable_higher: Vec<NodeId> = Vec::new();
+
     for id in higher.iter() {
         println!("[Node {}] ⚡ ELECTION: Sending election message to Node {}", me, id);
-        net.send(*id, &Message::Election { from: me }).await.ok();
+        match net.send(*id, &Message::Election { from: me }).await {
+            Ok(()) => {
+                println!("[Node {}] ✅ ELECTION: Node {} is reachable", me, id);
+                reachable_higher.push(*id);
+            }
+            Err(e) => {
+                eprintln!("[Node {}] ⚠️  ELECTION: Node {} is unreachable: {}", me, id, e);
+                unreachable_higher.push(*id);
+            }
+        }
+    }
+
+    // Report reachability status
+    if !unreachable_higher.is_empty() {
+        println!("[Node {}] ⚠️  ELECTION: {} node(s) unreachable: {:?}", me, unreachable_higher.len(), unreachable_higher);
+    }
+
+    if reachable_higher.is_empty() {
+        // No higher priority nodes are reachable - become leader immediately
+        println!("[Node {}] ⚡ ELECTION: No reachable higher priority nodes, becoming leader immediately", me);
+        {
+            let mut g = leader.write().await;
+            *g = Some(me);
+        }
+        let peer_count = peers.len() - 1;
+        println!("[Node {}] 📢 ELECTION: Announcing leadership to {} peers", me, peer_count);
+        for (&id, _) in peers.iter() {
+            if id == me { continue; }
+            net.send(id, &Message::Coordinator { leader: me, term: 1 }).await.ok();
+        }
+        println!("[Node {}] 💓 HEARTBEAT: Starting heartbeat task", me);
+        let h = start_heartbeat_task(me, net.clone(), peers.clone());
+        *heartbeat_handle.write().await = Some(h);
+        *participating.write().await = false;
+        return;
     }
 
     // wait for any Ok for a timeout (reduced from 5s to 2s)
-    println!("[Node {}] ⚡ ELECTION: Waiting 2 seconds for OK responses...", me);
+    println!("[Node {}] ⚡ ELECTION: Waiting 2 seconds for OK responses from {} reachable nodes...", me, reachable_higher.len());
     let wait_dur = Duration::from_secs(2);
     let start = Instant::now();
     while Instant::now().duration_since(start) < wait_dur {
